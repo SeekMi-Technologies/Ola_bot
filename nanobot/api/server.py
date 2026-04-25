@@ -49,8 +49,13 @@ def _error_json(status: int, message: str, err_type: str = "invalid_request_erro
     )
 
 
-def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
-    return {
+def _chat_completion_response(
+    content: str,
+    model: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    resp: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -64,6 +69,9 @@ def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+    if metadata:
+        resp["metadata"] = metadata
+    return resp
 
 
 def _response_text(value: Any) -> str:
@@ -286,6 +294,22 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     # -- non-streaming path (original logic) --
     _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
 
+    # Collect structured tool events emitted by the agent loop. Mirrors what
+    # bus channels do (see _bus_progress in agent/loop.py): each tool call
+    # publishes a "start" payload and a "end"/"error" payload. We surface
+    # them in the response so HTTP clients (e.g. CRM olaController) can render
+    # rich blocks without having to subscribe to the bus.
+    captured_tool_events: list[dict[str, Any]] = []
+
+    async def _capture_tool_events(
+        content: str,
+        *,
+        tool_hint: bool = False,
+        tool_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if tool_events:
+            captured_tool_events.extend(tool_events)
+
     try:
         async with session_lock:
             try:
@@ -296,6 +320,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        on_progress=_capture_tool_events,
                     ),
                     timeout=timeout_s,
                 )
@@ -310,6 +335,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            on_progress=_capture_tool_events,
                         ),
                         timeout=timeout_s,
                     )
@@ -327,7 +353,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         logger.exception("Unexpected API lock error for session {}", session_key)
         return _error_json(500, "Internal server error", err_type="server_error")
 
-    return web.json_response(_chat_completion_response(response_text, model_name))
+    extra_metadata = {"tool_events": captured_tool_events} if captured_tool_events else None
+    return web.json_response(
+        _chat_completion_response(response_text, model_name, metadata=extra_metadata)
+    )
 
 
 async def handle_models(request: web.Request) -> web.Response:
