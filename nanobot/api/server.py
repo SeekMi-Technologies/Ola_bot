@@ -105,6 +105,17 @@ def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None 
     return f"data: {_json.dumps(payload)}\n\n".encode()
 
 
+def _sse_tool_event(event: dict[str, Any]) -> bytes:
+    """Format a single tool_event SSE frame as a named event.
+
+    Standard OpenAI SSE clients ignore named events (they only consume
+    default-event chat.completion.chunk frames), so adding this is
+    backwards-compatible. Consumers that subscribe to `tool_event` (e.g.
+    Ola CRM olaController) get real-time tool start/end notifications.
+    """
+    return f"event: tool_event\ndata: {_json.dumps(event)}\n\n".encode()
+
+
 _SSE_DONE = b"data: [DONE]\n\n"
 
 # ---------------------------------------------------------------------------
@@ -246,14 +257,35 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         await resp.prepare(request)
 
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        # Queue items: ("text", str) text delta | ("tool_event", dict) | ("end", None)
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         stream_failed = False
 
         async def _on_stream(token: str) -> None:
-            await queue.put(token)
+            await queue.put(("text", token))
 
-        async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
-            await queue.put(None)
+        async def _on_stream_end(*_a: Any, resuming: bool = False, **_kw: Any) -> None:
+            # resuming=True means the agent is pausing to run tools; more
+            # streamed text will follow. Only resuming=False is the real end.
+            # See nanobot/agent/runner.py:286 for the resuming=True call site.
+            if not resuming:
+                await queue.put(("end", None))
+
+        # Real-time tool_event progress callback. Mirrors _capture_tool_events()
+        # in the non-stream path (which batches into metadata.tool_events at the
+        # end), but streams each event into the SSE response as it happens.
+        # Signature must accept (content, *, tool_hint, tool_events) per
+        # nanobot/utils/progress_events.py:invoke_on_progress contract.
+        async def _on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict[str, Any]] | None = None,
+        ) -> None:
+            if not tool_events:
+                return
+            for ev in tool_events:
+                await queue.put(("tool_event", ev))
 
         async def _run() -> None:
             nonlocal stream_failed
@@ -268,21 +300,25 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            on_progress=_on_progress,
                         ),
                         timeout=timeout_s,
                     )
             except Exception:
                 stream_failed = True
                 logger.exception("Streaming error for session {}", session_key)
-                await queue.put(None)
+                await queue.put(("end", None))
 
         task = asyncio.create_task(_run())
         try:
             while True:
-                token = await queue.get()
-                if token is None:
+                kind, payload = await queue.get()
+                if kind == "end":
                     break
-                await resp.write(_sse_chunk(token, model_name, chunk_id))
+                if kind == "text":
+                    await resp.write(_sse_chunk(payload, model_name, chunk_id))
+                elif kind == "tool_event":
+                    await resp.write(_sse_tool_event(payload))
         finally:
             task.cancel()
 
