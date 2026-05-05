@@ -181,6 +181,16 @@ class EmailChannel(BaseChannel):
             logger.warning("Skip email send: consent_granted is false")
             return
 
+        # Drop streaming-UI progress messages. agent.loop publishes one
+        # OutboundMessage per tool-call iteration with metadata._progress
+        # (or _tool_hint / _retry_wait) so a real-time chat UI can render
+        # a live trace. Email is delivery-grade, not streaming — sending
+        # each iteration produces a 30-40x spam amplification on top of
+        # the final response. Final responses do not carry these flags.
+        meta = msg.metadata or {}
+        if meta.get("_progress") or meta.get("_tool_hint") or meta.get("_retry_wait"):
+            return
+
         if not self.config.smtp_host:
             logger.warning("Email channel SMTP host not configured")
             return
