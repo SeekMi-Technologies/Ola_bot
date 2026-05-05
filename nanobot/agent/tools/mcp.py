@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -11,6 +12,58 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+
+# ---------------------------------------------------------------------------
+# Ola CRM acting-as identity (issue #185 ISO5)
+#
+# Carries the current request's acting-as admin._id from the chat completions
+# entry point (api/server.py extracts it from X-Ola-Acting-As header) down to
+# the per-call HTTP request to the MCP server, where _inject_acting_as_hook
+# attaches it as the X-Acting-As HTTP header.
+#
+# ContextVar is asyncio-task-local: concurrent chat sessions get isolated
+# values automatically, no shared mutable state.
+#
+# When the value is None (e.g. chat completions called without the header),
+# no X-Acting-As header is added — the MCP server falls back to systemAdmin
+# for back-compat.
+# ---------------------------------------------------------------------------
+_acting_as_ctx: ContextVar[str | None] = ContextVar("ola_acting_as", default=None)
+
+
+def set_acting_as(value: str | None) -> None:
+    """Store the current request's acting-as identity.
+
+    Called by api/server.handle_chat_completions before invoking the agent
+    loop. Subsequent MCP HTTP calls in the same async task will pick up the
+    value via _inject_acting_as_hook below.
+
+    Normalization: empty / whitespace-only / non-string inputs are stored as
+    None. This prevents the hook from attaching a meaningless header (e.g.
+    "X-Acting-As:    ") that the MCP server would just reject as VALIDATION.
+    """
+    if value is None or not isinstance(value, str):
+        _acting_as_ctx.set(None)
+        return
+    trimmed = value.strip()
+    _acting_as_ctx.set(trimmed if trimmed else None)
+
+
+def get_acting_as() -> str | None:
+    """Read the current acting-as identity (test helper, also for diagnostics)."""
+    return _acting_as_ctx.get()
+
+
+async def _inject_acting_as_hook(request: httpx.Request) -> None:
+    """httpx.AsyncClient request event hook — attach X-Acting-As header.
+
+    Runs immediately before the HTTP request is sent. Connection-level
+    headers (Authorization service token) come from cfg.headers; this hook
+    adds the per-request X-Acting-As when a value is in context.
+    """
+    val = _acting_as_ctx.get()
+    if val:
+        request.headers["X-Acting-As"] = val
 
 # Transient connection errors that warrant a single retry.
 # These typically happen when an MCP server restarts or a network
@@ -490,9 +543,14 @@ async def connect_mcp_servers(
                     sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
                 )
             elif transport_type == "streamableHttp":
+                # ISO5 (Ola CRM #185): attach event hook so per-request
+                # X-Acting-As header is injected from contextvar before each
+                # outgoing MCP HTTP call. cfg.headers (Authorization) stays
+                # connection-level static.
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
+                        event_hooks={"request": [_inject_acting_as_hook]},
                         follow_redirects=True,
                         timeout=None,
                     )
