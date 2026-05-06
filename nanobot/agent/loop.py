@@ -29,6 +29,7 @@ from nanobot.agent.tools.ask import (
 )
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.mcp import set_acting_as
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -624,6 +625,15 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        # Re-establish acting-as in this task's context: ContextVar does not
+        # propagate across the bus queue, so channels carry it via metadata.
+        set_acting_as((msg.metadata or {}).get("_acting_as"))
+
+        # Mirror process_direct: retry MCP connection on every message so a
+        # startup race (port-up before protocol-ready) does not leave bus
+        # channels permanently without MCP tools. Cheap when already connected.
+        await self._connect_mcp()
+
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
