@@ -55,7 +55,15 @@ def _chat_completion_response(
     model: str,
     *,
     metadata: dict[str, Any] | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # When usage is supplied (Ola CRM #98 — auto-title path uses non-streaming
+    # to track token spend), pass it through verbatim. Otherwise fall back to
+    # the zero placeholder so OpenAI clients always see the field.
+    usage_payload: dict[str, Any] = (
+        dict(usage) if isinstance(usage, dict) and usage
+        else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    )
     resp: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -68,7 +76,7 @@ def _chat_completion_response(
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage_payload,
     }
     if metadata:
         resp["metadata"] = metadata
@@ -432,8 +440,15 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         return _error_json(500, "Internal server error", err_type="server_error")
 
     extra_metadata = {"tool_events": captured_tool_events} if captured_tool_events else None
+    last_usage = getattr(agent_loop, "_last_usage", None)
+    usage_payload = last_usage if isinstance(last_usage, dict) and last_usage else None
     return web.json_response(
-        _chat_completion_response(response_text, model_name, metadata=extra_metadata)
+        _chat_completion_response(
+            response_text,
+            model_name,
+            metadata=extra_metadata,
+            usage=usage_payload,
+        )
     )
 
 
