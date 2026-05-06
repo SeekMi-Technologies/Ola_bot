@@ -7,7 +7,7 @@ import dataclasses
 import json
 import os
 import time
-from contextlib import AsyncExitStack, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -263,7 +263,7 @@ class AgentLoop:
         self._unified_session = unified_session
         self._running = False
         self._mcp_servers = mcp_servers or {}
-        self._mcp_stacks: dict[str, AsyncExitStack] = {}
+        self._mcp_pool = None  # MCPClientPool, set by _connect_mcp
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -347,24 +347,31 @@ class AgentLoop:
             )
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
+        """Discover MCP server tools/resources/prompts and register pool-backed
+        wrappers. Per-identity transports open lazily on first execute()."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
 
         try:
-            self._mcp_stacks = await connect_mcp_servers(self._mcp_servers, self.tools)
-            if self._mcp_stacks:
+            pool, succeeded = await connect_mcp_servers(self._mcp_servers, self.tools)
+            if succeeded > 0:
+                self._mcp_pool = pool
                 self._mcp_connected = True
             else:
                 logger.warning("No MCP servers connected successfully (will retry next message)")
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                self._mcp_pool = None
         except asyncio.CancelledError:
             logger.warning("MCP connection cancelled (will retry next message)")
-            self._mcp_stacks.clear()
+            self._mcp_pool = None
         except BaseException as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            self._mcp_stacks.clear()
+            self._mcp_pool = None
         finally:
             self._mcp_connecting = False
 
@@ -656,7 +663,15 @@ class AgentLoop:
         """Process a message: per-session serial, cross-session concurrent."""
         # Re-establish acting-as in this task's context: ContextVar does not
         # propagate across the bus queue, so channels carry it via metadata.
-        set_acting_as((msg.metadata or {}).get("_acting_as"))
+        _acting = (msg.metadata or {}).get("_acting_as")
+        set_acting_as(_acting)
+        # TEMP TRACE — investigating transport-task contextvar freeze
+        try:
+            _task = asyncio.current_task()
+            _tname = _task.get_name() if _task else "?"
+        except Exception:
+            _tname = "?"
+        logger.info("[OLA-TRACE] _dispatch entry task={} channel={} chat_id={} acting_as={!r}", _tname, msg.channel, msg.chat_id, _acting)
 
         # Mirror process_direct: retry MCP connection on every message so a
         # startup race (port-up before protocol-ready) does not leave bus
@@ -773,16 +788,17 @@ class AgentLoop:
                     )
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
+        """Drain pending background archives, then close MCP pool transports."""
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
-        for name, stack in self._mcp_stacks.items():
+        if self._mcp_pool is not None:
             try:
-                await stack.aclose()
+                await self._mcp_pool.close()
             except (RuntimeError, BaseExceptionGroup):
-                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
-        self._mcp_stacks.clear()
+                logger.debug("MCP pool cleanup error (can be ignored)")
+            self._mcp_pool = None
+        self._mcp_connected = False
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
