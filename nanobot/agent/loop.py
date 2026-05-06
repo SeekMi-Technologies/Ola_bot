@@ -60,6 +60,23 @@ if TYPE_CHECKING:
     from nanobot.cron.service import CronService
 
 
+def _provider_name(provider: LLMProvider) -> str:
+    """Canonical provider key for telemetry (Ola CRM #98 LLMUsage).
+
+    OpenAICompatProvider sets `_spec.name` ('openai', 'gemini', 'dashscope', ...);
+    AnthropicProvider has no _spec → hardcode 'anthropic'; anything else falls
+    back to the class name lowercased without a 'provider' suffix.
+    """
+    spec = getattr(provider, "_spec", None)
+    name = getattr(spec, "name", None) if spec is not None else None
+    if isinstance(name, str) and name:
+        return name
+    cls = type(provider).__name__
+    if cls == "AnthropicProvider":
+        return "anthropic"
+    return cls.lower().replace("provider", "") or "unknown"
+
+
 UNIFIED_SESSION_KEY = "unified:default"
 
 
@@ -225,7 +242,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
-        self._last_usage: dict[str, int] = {}
+        self._last_usage: dict[str, Any] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
@@ -536,7 +553,19 @@ class AgentLoop:
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
         ))
-        self._last_usage = result.usage
+        prompt_tokens = int(result.usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(result.usage.get("completion_tokens", 0) or 0)
+        total_tokens = int(result.usage.get("total_tokens", 0) or 0) or (prompt_tokens + completion_tokens)
+        cached_tokens = int(result.usage.get("cached_tokens", 0) or 0)
+        self._last_usage = {
+            "provider": _provider_name(self.provider),
+            "model": self.model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "iterations": result.iterations,
+        }
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             # Push final content through stream so streaming channels (e.g. Feishu)
