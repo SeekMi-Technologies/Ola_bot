@@ -91,6 +91,7 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    iterations: int = 0
 
 
 class AgentRunner:
@@ -241,8 +242,10 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        iterations_completed = 0
 
         for iteration in range(spec.max_iterations):
+            iterations_completed = iteration + 1
             try:
                 # Keep the persisted conversation untouched. Context governance
                 # may repair or compact historical messages for the model, but
@@ -413,6 +416,8 @@ class AgentRunner:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=False)
                 response = await self._request_finalization_retry(spec, messages_for_model)
+                # Retry stays inside the same logical turn — token usage is folded into
+                # the iteration's accumulator, but iterations_completed is NOT bumped.
                 retry_usage = self._usage_dict(response.usage)
                 self._accumulate_usage(usage, retry_usage)
                 raw_usage = self._merge_usage(raw_usage, retry_usage)
@@ -558,6 +563,7 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
+            iterations=iterations_completed,
         )
 
     def _build_request_kwargs(
