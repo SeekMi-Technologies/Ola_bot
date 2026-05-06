@@ -1,25 +1,34 @@
-"""Concurrent _dispatch contextvar isolation stress test.
+"""DEPRECATED — false-positive coverage of the X-Acting-As propagation path.
 
-Reproduces the 1:20 PT 5-6 production race — Will + zyd inbound at the same
-polling cycle each landed in their own _dispatch task. Will's customer set
-should not leak into zyd's MCP request, and vice versa.
+Kept as a counter-example. These tests sample `_acting_as_ctx` from the
+caller's task with a mocked transport, so they cannot observe the SDK
+spawning `post_writer` / `handle_request_async` tasks that captured the
+contextvar at connect time. Result: the suite was green throughout the
+1:20 PT 2026-05-06 incident even though every concurrent dispatch was
+silently routing through systemAdmin.
 
-Approach: mock _process_message to sample _acting_as_ctx at multiple points
-across an interleaved await chain (mimicking real LLM iteration latency),
-then verify every sample for a given chat_id sees only that chat's own
-admin_id.
+The replacement is `tests/agent/test_mcp_pool_real_transport.py`, which
+exercises the real `streamable_http_client` against an aiohttp fake MCP
+server and verifies the actual outbound `X-Acting-As` header per call.
 
-If this test passes consistently → ContextVar task-local isolation works,
-the 1:20 PT race was caused by something other than contextvar bleed (see
-test_dispatch_acting_as_under_connect_mcp_race for the suspect path).
+Skipped at import time so CI does not surface deceptive green checks.
 """
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason=(
+        "DEPRECATED: pure-mock coverage of the SDK transport path is a "
+        "false-positive (Phase ISO 2026-05-06). See "
+        "tests/agent/test_mcp_pool_real_transport.py for the real-transport "
+        "replacement."
+    )
+)
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.mcp import _acting_as_ctx
