@@ -30,7 +30,11 @@ from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
 
-_OLA_MCP_URL = "http://127.0.0.1:8889/mcp"
+# Box2 (ai role) runs the email channel but Box1 (app role) hosts MCP, so the
+# loopback default only works for single-box dev. Prod must set OLA_MCP_URL
+# (e.g. http://100.109.220.126:8889/mcp via Tailscale) on the gateway service.
+# Closes Ola#204.
+_OLA_MCP_URL = os.environ.get("OLA_MCP_URL", "http://127.0.0.1:8889/mcp")
 
 
 class EmailConfig(Base):
