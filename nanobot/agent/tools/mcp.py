@@ -9,6 +9,7 @@ spawned-task contextvar inheritance pitfall (Phase ISO 2026-05-06).
 import asyncio
 import os
 import shutil
+from collections import OrderedDict
 from contextlib import AsyncExitStack
 from contextvars import ContextVar
 from typing import Any
@@ -165,14 +166,22 @@ class MCPClientPool:
     spawn time and never needs a contextvar lookup. For stdio transports
     the acting_as key is forced to None — subprocess pipes don't carry HTTP
     headers, so all stdio calls share one transport.
+
+    LRU-capped at `max_size` entries (default 50) — Ola has <20 admins, so
+    this is a 2.5x defensive cap against runaway identity churn (e.g. a
+    misconfigured agent calling tools with random acting_as values). On
+    overflow, the least-recently-used entry's stack is closed and dropped.
     """
 
-    def __init__(self, server_configs: dict) -> None:
+    def __init__(self, server_configs: dict, *, max_size: int = 50) -> None:
         self._configs = dict(server_configs)
-        self._sessions: dict[tuple[str, str | None], Any] = {}
+        # OrderedDict so we can move-to-end on access (LRU) and popitem(last=False)
+        # to evict the oldest entry when over `max_size`.
+        self._sessions: OrderedDict[tuple[str, str | None], Any] = OrderedDict()
         self._stacks: dict[tuple[str, str | None], AsyncExitStack] = {}
         self._lock = asyncio.Lock()
         self._closed = False
+        self._max_size = max(1, int(max_size))
 
     def has_server(self, server_name: str) -> bool:
         return server_name in self._configs
@@ -209,15 +218,35 @@ class MCPClientPool:
         key = (server_name, acting_as)
         sess = self._sessions.get(key)
         if sess is not None:
+            self._sessions.move_to_end(key)  # LRU: mark recently used
             return sess
 
         async with self._lock:
             sess = self._sessions.get(key)
             if sess is not None:
+                self._sessions.move_to_end(key)
                 return sess
             sess = await self._open(server_name, acting_as)
             self._sessions[key] = sess
+            await self._evict_overflow_locked()
             return sess
+
+    async def _evict_overflow_locked(self) -> None:
+        """Drop the least-recently-used entry if pool is over capacity.
+        Caller must hold self._lock."""
+        while len(self._sessions) > self._max_size:
+            evict_key, _ = self._sessions.popitem(last=False)
+            stack = self._stacks.pop(evict_key, None)
+            if stack is None:
+                continue
+            try:
+                await stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                # Cross-task anyio cleanup can raise here; harmless because
+                # the entry is gone from both maps regardless.
+                logger.debug("MCP pool: evicted entry {} cleanup raised (ignored)", evict_key)
+            except Exception as e:
+                logger.warning("MCP pool: evicting {}: {}", evict_key, e)
 
     async def _open(self, server_name: str, acting_as: str | None) -> Any:
         from mcp import ClientSession, StdioServerParameters

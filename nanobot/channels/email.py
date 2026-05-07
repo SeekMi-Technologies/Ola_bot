@@ -8,6 +8,8 @@ import os
 import re
 import smtplib
 import ssl
+
+import httpx
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
@@ -259,7 +261,16 @@ class EmailChannel(BaseChannel):
             raise
 
     async def _resolve_sender_acting_as(self, sender: str) -> str | None:
-        """Return admin._id for known sender, None for unknown, raise on error."""
+        """Return admin._id for known sender, None for unknown, raise on error.
+
+        Wrapped in asyncio.wait_for so a stuck MCP server can never block the
+        IMAP polling loop indefinitely. Exceeded timeout raises asyncio.
+        TimeoutError, which the caller already treats as a transient pre-lookup
+        failure (drops the email without dispatching to the agent).
+        """
+        return await asyncio.wait_for(self._resolve_sender_acting_as_inner(sender), timeout=10.0)
+
+    async def _resolve_sender_acting_as_inner(self, sender: str) -> str | None:
         token = os.environ.get("MCP_SERVICE_TOKEN")
         if not token:
             raise RuntimeError(
@@ -267,19 +278,26 @@ class EmailChannel(BaseChannel):
                 "channel sender pre-lookup"
             )
 
+        # Use the non-deprecated SDK entry point; build our own httpx client
+        # so the Authorization header (and timeout) are connection-level rather
+        # than passed through SDK kwargs that the deprecated wrapper exposes.
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
+        from mcp.client.streamable_http import streamable_http_client
 
-        async with streamablehttp_client(
-            _OLA_MCP_URL,
+        async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {token}"},
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(
-                    "salesperson.lookup_by_email",
-                    {"email": sender},
-                )
+            timeout=10.0,
+        ) as http_client:
+            async with streamable_http_client(
+                _OLA_MCP_URL,
+                http_client=http_client,
+            ) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(
+                        "salesperson.lookup_by_email",
+                        {"email": sender},
+                    )
 
         if result.isError:
             raise RuntimeError(

@@ -228,12 +228,11 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
     """POST /v1/chat/completions — supports JSON and multipart/form-data."""
-    # ISO5b (Ola CRM #185): extract acting-as identity from header and store
-    # in contextvar BEFORE any await/branch. Downstream agent loop and MCP
-    # tool calls (in this same async task and its children) will pick it up
-    # via _inject_acting_as_hook in nanobot/agent/tools/mcp.py. When the
-    # header is absent (non-Ola callers, direct curl), the contextvar stays
-    # None and MCP server falls back to systemAdmin.
+    # Extract acting-as identity from X-Ola-Acting-As and store in contextvar
+    # before any await. MCPToolWrapper.execute reads it in the caller's task
+    # to pick the matching transport from MCPClientPool, which has the right
+    # X-Acting-As baked into the httpx client headers. Header absent → stays
+    # None → backend falls back to systemAdmin.
     set_acting_as(request.headers.get("X-Ola-Acting-As"))
 
     content_type = request.content_type or ""

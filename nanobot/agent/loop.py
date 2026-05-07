@@ -665,13 +665,6 @@ class AgentLoop:
         # propagate across the bus queue, so channels carry it via metadata.
         _acting = (msg.metadata or {}).get("_acting_as")
         set_acting_as(_acting)
-        # TEMP TRACE — investigating transport-task contextvar freeze
-        try:
-            _task = asyncio.current_task()
-            _tname = _task.get_name() if _task else "?"
-        except Exception:
-            _tname = "?"
-        logger.info("[OLA-TRACE] _dispatch entry task={} channel={} chat_id={} acting_as={!r}", _tname, msg.channel, msg.chat_id, _acting)
 
         # Mirror process_direct: retry MCP connection on every message so a
         # startup race (port-up before protocol-ready) does not leave bus
