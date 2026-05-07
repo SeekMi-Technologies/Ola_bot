@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -197,6 +197,7 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
         session_key=API_SESSION_KEY,
         channel="api",
         chat_id=API_CHAT_ID,
+        on_progress=ANY,
     )
 
 
@@ -425,3 +426,77 @@ async def test_process_direct_accepts_media() -> None:
     assert captured_msg is not None
     assert captured_msg.media == ["/tmp/image.png", "/tmp/report.pdf"]
     assert captured_msg.content == "analyze this"
+
+
+# ---------------------------------------------------------------------------
+# Ola CRM #98 — non-streaming usage surfaced from agent_loop._last_usage
+# ---------------------------------------------------------------------------
+
+
+_USAGE_FRAME = {
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite-preview",
+    "prompt_tokens": 220,
+    "completion_tokens": 18,
+    "total_tokens": 238,
+    "cached_tokens": 0,
+    "iterations": 1,
+}
+
+
+def test_chat_completion_response_passes_usage_through() -> None:
+    """When usage is supplied, response.usage matches verbatim (issue #98 N4)."""
+    result = _chat_completion_response(
+        "title here", "test-model", usage=_USAGE_FRAME,
+    )
+    assert result["usage"] == _USAGE_FRAME
+
+
+def test_chat_completion_response_zero_usage_when_omitted() -> None:
+    """Backwards compat: omitted usage falls back to {0,0,0} placeholder."""
+    result = _chat_completion_response("hi", "test-model")
+    assert result["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def test_chat_completion_response_zero_usage_when_empty_dict() -> None:
+    """Empty dict counts as no usage — same as omitting."""
+    result = _chat_completion_response("hi", "test-model", usage={})
+    assert result["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_non_streaming_response_includes_real_usage(aiohttp_client) -> None:
+    """End-to-end: non-streaming POST returns response.usage from agent._last_usage."""
+    agent = _make_mock_agent("Generated Title")
+    agent._last_usage = dict(_USAGE_FRAME)
+    app = create_app(agent, model_name="test-model", request_timeout=10.0)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "give me a title"}]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+
+    assert body["usage"] == _USAGE_FRAME
+    # Sanity: assistant content still comes through
+    assert body["choices"][0]["message"]["content"] == "Generated Title"
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_non_streaming_response_zero_usage_when_agent_has_no_usage(aiohttp_client) -> None:
+    """Legacy edge: agent_loop with empty _last_usage → response keeps {0,0,0}."""
+    agent = _make_mock_agent("ok")
+    agent._last_usage = {}
+    app = create_app(agent, model_name="test-model", request_timeout=10.0)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    body = await resp.json()
+    assert body["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

@@ -7,7 +7,7 @@ import dataclasses
 import json
 import os
 import time
-from contextlib import AsyncExitStack, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -29,6 +29,7 @@ from nanobot.agent.tools.ask import (
 )
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.mcp import set_acting_as
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -57,6 +58,23 @@ from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
     from nanobot.cron.service import CronService
+
+
+def _provider_name(provider: LLMProvider) -> str:
+    """Canonical provider key for telemetry (Ola CRM #98 LLMUsage).
+
+    OpenAICompatProvider sets `_spec.name` ('openai', 'gemini', 'dashscope', ...);
+    AnthropicProvider has no _spec → hardcode 'anthropic'; anything else falls
+    back to the class name lowercased without a 'provider' suffix.
+    """
+    spec = getattr(provider, "_spec", None)
+    name = getattr(spec, "name", None) if spec is not None else None
+    if isinstance(name, str) and name:
+        return name
+    cls = type(provider).__name__
+    if cls == "AnthropicProvider":
+        return "anthropic"
+    return cls.lower().replace("provider", "") or "unknown"
 
 
 UNIFIED_SESSION_KEY = "unified:default"
@@ -224,7 +242,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
-        self._last_usage: dict[str, int] = {}
+        self._last_usage: dict[str, Any] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
@@ -245,7 +263,7 @@ class AgentLoop:
         self._unified_session = unified_session
         self._running = False
         self._mcp_servers = mcp_servers or {}
-        self._mcp_stacks: dict[str, AsyncExitStack] = {}
+        self._mcp_pool = None  # MCPClientPool, set by _connect_mcp
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -329,24 +347,31 @@ class AgentLoop:
             )
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
+        """Discover MCP server tools/resources/prompts and register pool-backed
+        wrappers. Per-identity transports open lazily on first execute()."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
 
         try:
-            self._mcp_stacks = await connect_mcp_servers(self._mcp_servers, self.tools)
-            if self._mcp_stacks:
+            pool, succeeded = await connect_mcp_servers(self._mcp_servers, self.tools)
+            if succeeded > 0:
+                self._mcp_pool = pool
                 self._mcp_connected = True
             else:
                 logger.warning("No MCP servers connected successfully (will retry next message)")
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                self._mcp_pool = None
         except asyncio.CancelledError:
             logger.warning("MCP connection cancelled (will retry next message)")
-            self._mcp_stacks.clear()
+            self._mcp_pool = None
         except BaseException as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            self._mcp_stacks.clear()
+            self._mcp_pool = None
         finally:
             self._mcp_connecting = False
 
@@ -535,7 +560,19 @@ class AgentLoop:
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
         ))
-        self._last_usage = result.usage
+        prompt_tokens = int(result.usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(result.usage.get("completion_tokens", 0) or 0)
+        total_tokens = int(result.usage.get("total_tokens", 0) or 0) or (prompt_tokens + completion_tokens)
+        cached_tokens = int(result.usage.get("cached_tokens", 0) or 0)
+        self._last_usage = {
+            "provider": _provider_name(self.provider),
+            "model": self.model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "iterations": result.iterations,
+        }
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             # Push final content through stream so streaming channels (e.g. Feishu)
@@ -624,6 +661,16 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        # Re-establish acting-as in this task's context: ContextVar does not
+        # propagate across the bus queue, so channels carry it via metadata.
+        _acting = (msg.metadata or {}).get("_acting_as")
+        set_acting_as(_acting)
+
+        # Mirror process_direct: retry MCP connection on every message so a
+        # startup race (port-up before protocol-ready) does not leave bus
+        # channels permanently without MCP tools. Cheap when already connected.
+        await self._connect_mcp()
+
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
@@ -734,16 +781,17 @@ class AgentLoop:
                     )
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
+        """Drain pending background archives, then close MCP pool transports."""
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
-        for name, stack in self._mcp_stacks.items():
+        if self._mcp_pool is not None:
             try:
-                await stack.aclose()
+                await self._mcp_pool.close()
             except (RuntimeError, BaseExceptionGroup):
-                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
-        self._mcp_stacks.clear()
+                logger.debug("MCP pool cleanup error (can be ignored)")
+            self._mcp_pool = None
+        self._mcp_connected = False
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

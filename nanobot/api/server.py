@@ -15,6 +15,7 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.tools.mcp import set_acting_as
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -49,8 +50,21 @@ def _error_json(status: int, message: str, err_type: str = "invalid_request_erro
     )
 
 
-def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
-    return {
+def _chat_completion_response(
+    content: str,
+    model: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # When usage is supplied (Ola CRM #98 — auto-title path uses non-streaming
+    # to track token spend), pass it through verbatim. Otherwise fall back to
+    # the zero placeholder so OpenAI clients always see the field.
+    usage_payload: dict[str, Any] = (
+        dict(usage) if isinstance(usage, dict) and usage
+        else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    )
+    resp: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -62,8 +76,11 @@ def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage_payload,
     }
+    if metadata:
+        resp["metadata"] = metadata
+    return resp
 
 
 def _response_text(value: Any) -> str:
@@ -95,6 +112,29 @@ def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None 
         ],
     }
     return f"data: {_json.dumps(payload)}\n\n".encode()
+
+
+def _sse_tool_event(event: dict[str, Any]) -> bytes:
+    """Format a single tool_event SSE frame as a named event.
+
+    Standard OpenAI SSE clients ignore named events (they only consume
+    default-event chat.completion.chunk frames), so adding this is
+    backwards-compatible. Consumers that subscribe to `tool_event` (e.g.
+    Ola CRM olaController) get real-time tool start/end notifications.
+    """
+    return f"event: tool_event\ndata: {_json.dumps(event)}\n\n".encode()
+
+
+def _sse_usage(usage: dict[str, Any]) -> bytes:
+    """Format a single usage SSE frame as a named event (Ola CRM #98).
+
+    Same backwards-compatible mechanism as tool_event — standard OpenAI
+    clients ignore named events. Schema is the 7-field flat dict produced
+    by AgentLoop._last_usage (loop.py): provider, model, prompt_tokens,
+    completion_tokens, total_tokens, cached_tokens, iterations. Consumed
+    by Ola CRM olaController/chat.js to write LlmUsage rows.
+    """
+    return f"event: usage\ndata: {_json.dumps(usage)}\n\n".encode()
 
 
 _SSE_DONE = b"data: [DONE]\n\n"
@@ -188,6 +228,13 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
     """POST /v1/chat/completions — supports JSON and multipart/form-data."""
+    # Extract acting-as identity from X-Ola-Acting-As and store in contextvar
+    # before any await. MCPToolWrapper.execute reads it in the caller's task
+    # to pick the matching transport from MCPClientPool, which has the right
+    # X-Acting-As baked into the httpx client headers. Header absent → stays
+    # None → backend falls back to systemAdmin.
+    set_acting_as(request.headers.get("X-Ola-Acting-As"))
+
     content_type = request.content_type or ""
     if not isinstance(content_type, str):
         content_type = ""
@@ -238,14 +285,42 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         await resp.prepare(request)
 
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        # Queue items:
+        #   ("text", str)         streamed text delta from the LLM
+        #   ("tool_event", dict)  tool start/end progress event
+        #   ("usage", dict)       per-turn token telemetry (Ola CRM #98), pushed
+        #                         once from _run() finally block AFTER
+        #                         process_direct sets agent_loop._last_usage
+        #   ("end", None)         consumer-loop terminator, also pushed from
+        #                         _run() finally so it always lands AFTER usage
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         stream_failed = False
 
         async def _on_stream(token: str) -> None:
-            await queue.put(token)
+            await queue.put(("text", token))
 
-        async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
-            await queue.put(None)
+        async def _on_stream_end(*_a: Any, resuming: bool = False, **_kw: Any) -> None:
+            # resuming=True means the agent is pausing to run tools; more
+            # streamed text will follow. resuming=False = real end of stream.
+            # No-op here: end + usage are both pushed from _run()'s finally
+            # block so we can include the freshly-set _last_usage in-band.
+            return
+
+        # Real-time tool_event progress callback. Mirrors _capture_tool_events()
+        # in the non-stream path (which batches into metadata.tool_events at the
+        # end), but streams each event into the SSE response as it happens.
+        # Signature must accept (content, *, tool_hint, tool_events) per
+        # nanobot/utils/progress_events.py:invoke_on_progress contract.
+        async def _on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict[str, Any]] | None = None,
+        ) -> None:
+            if not tool_events:
+                return
+            for ev in tool_events:
+                await queue.put(("tool_event", ev))
 
         async def _run() -> None:
             nonlocal stream_failed
@@ -260,21 +335,39 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            on_progress=_on_progress,
                         ),
                         timeout=timeout_s,
                     )
             except Exception:
                 stream_failed = True
                 logger.exception("Streaming error for session {}", session_key)
-                await queue.put(None)
+            finally:
+                # Emit usage telemetry and the end signal as the last two queue
+                # items. _last_usage is set inside process_direct AFTER the
+                # runner returns, so it must be read here (after the await),
+                # not from inside _on_stream_end. Errored turns may still have
+                # partial usage data — we emit it so the dashboard can record
+                # spend on failed turns (Ola CRM #98). isinstance guard guards
+                # against MagicMock'd agent_loops in test fixtures and any
+                # malformed _last_usage state.
+                last_usage = getattr(agent_loop, "_last_usage", None)
+                if isinstance(last_usage, dict) and last_usage:
+                    await queue.put(("usage", last_usage))
+                await queue.put(("end", None))
 
         task = asyncio.create_task(_run())
         try:
             while True:
-                token = await queue.get()
-                if token is None:
+                kind, payload = await queue.get()
+                if kind == "end":
                     break
-                await resp.write(_sse_chunk(token, model_name, chunk_id))
+                if kind == "text":
+                    await resp.write(_sse_chunk(payload, model_name, chunk_id))
+                elif kind == "tool_event":
+                    await resp.write(_sse_tool_event(payload))
+                elif kind == "usage":
+                    await resp.write(_sse_usage(payload))
         finally:
             task.cancel()
 
@@ -286,6 +379,22 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     # -- non-streaming path (original logic) --
     _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
 
+    # Collect structured tool events emitted by the agent loop. Mirrors what
+    # bus channels do (see _bus_progress in agent/loop.py): each tool call
+    # publishes a "start" payload and a "end"/"error" payload. We surface
+    # them in the response so HTTP clients (e.g. CRM olaController) can render
+    # rich blocks without having to subscribe to the bus.
+    captured_tool_events: list[dict[str, Any]] = []
+
+    async def _capture_tool_events(
+        content: str,
+        *,
+        tool_hint: bool = False,
+        tool_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if tool_events:
+            captured_tool_events.extend(tool_events)
+
     try:
         async with session_lock:
             try:
@@ -296,6 +405,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        on_progress=_capture_tool_events,
                     ),
                     timeout=timeout_s,
                 )
@@ -310,6 +420,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            on_progress=_capture_tool_events,
                         ),
                         timeout=timeout_s,
                     )
@@ -327,7 +438,17 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         logger.exception("Unexpected API lock error for session {}", session_key)
         return _error_json(500, "Internal server error", err_type="server_error")
 
-    return web.json_response(_chat_completion_response(response_text, model_name))
+    extra_metadata = {"tool_events": captured_tool_events} if captured_tool_events else None
+    last_usage = getattr(agent_loop, "_last_usage", None)
+    usage_payload = last_usage if isinstance(last_usage, dict) and last_usage else None
+    return web.json_response(
+        _chat_completion_response(
+            response_text,
+            model_name,
+            metadata=extra_metadata,
+            usage=usage_payload,
+        )
+    )
 
 
 async def handle_models(request: web.Request) -> web.Response:

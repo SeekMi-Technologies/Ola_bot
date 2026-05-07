@@ -2989,3 +2989,150 @@ async def test_runner_binds_on_retry_wait_to_retry_callback_not_progress():
 
     assert captured["on_retry_wait"] is retry_wait_cb
     assert captured["on_retry_wait"] is not progress_cb
+
+
+# ---------------------------------------------------------------------------
+# Ola CRM #98 — `iterations` counter on AgentRunResult
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runner_iterations_one_call_no_tools():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+
+    async def chat_with_retry(**kwargs):
+        return LLMResponse(
+            content="hello",
+            tool_calls=[],
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "hello"
+    assert result.iterations == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_iterations_two_calls_with_tool():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="thinking",
+                tool_calls=[ToolCallRequest(id="c1", name="list_dir", arguments={"path": "."})],
+                usage={"prompt_tokens": 5, "completion_tokens": 3},
+            )
+        return LLMResponse(
+            content="done",
+            tool_calls=[],
+            usage={"prompt_tokens": 8, "completion_tokens": 2},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "do task"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "done"
+    assert result.tools_used == ["list_dir"]
+    assert result.iterations == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_iterations_finalization_retry_does_not_bump(monkeypatch):
+    """`_request_finalization_retry` is a separate provider call inside the same
+    iteration body; it MUST NOT bump iterations (issue #98).
+
+    Patches _MAX_EMPTY_RETRIES=0 so finalization fires on iter 0 directly:
+    one for-loop entry → one empty response → one finalization retry → done.
+    Provider sees 2 calls, but iterations counter sees 1 — proves the retry
+    call is not counted.
+    """
+    from nanobot.agent import runner as runner_mod
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    monkeypatch.setattr(runner_mod, "_MAX_EMPTY_RETRIES", 0)
+
+    provider = MagicMock()
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(content="", tool_calls=[], usage={"prompt_tokens": 1, "completion_tokens": 0})
+        return LLMResponse(
+            content="recovered",
+            tool_calls=[],
+            usage={"prompt_tokens": 4, "completion_tokens": 2},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=10,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "recovered"
+    # Two provider calls happened (1 empty + 1 finalization retry) but iter 0
+    # is the only loop body entry → iterations == 1.
+    assert call_count["n"] == 2
+    assert result.iterations == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_iterations_zero_max_iterations_safe():
+    """max_iterations=0 must not NameError — iterations falls through as 0."""
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock()
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=0,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    # Loop body never ran → iterations stays 0; max_iterations exhaustion path
+    assert result.iterations == 0
+    assert result.stop_reason == "max_iterations"
