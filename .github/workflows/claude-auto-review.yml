@@ -1,0 +1,84 @@
+name: Claude Auto Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "**/*.snap"
+
+jobs:
+  claude-review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          use_sticky_comment: true
+          prompt: |
+            Auto-review this nanobot pull request. SeekMi-Technologies/Ola_bot
+            is a downstream fork of HKUDS/nanobot, customised for the Ola CRM
+            integration. Focus on issues that actually break Ola in production.
+
+            Multi-tenant data isolation (highest priority):
+            - The MCP client transport must NEVER collapse acting-as identity
+              across users. If you see a single httpx.AsyncClient or a single
+              ClientSession reused across multiple admins, flag it — that was
+              the Phase ISO bug class (post_writer task contextvar freeze).
+            - X-Acting-As must be baked into the connection-level headers per
+              identity (MCPClientPool pattern), not injected via an httpx
+              event_hook reading a ContextVar at request time.
+            - set_acting_as / _acting_as_ctx changes must propagate from the
+              caller's task to the actual outgoing MCP HTTP request. Any path
+              that uses asyncio.create_task or anyio.create_task_group with a
+              long-lived background task that reads the contextvar inside is
+              a likely regression of the same bug.
+
+            Robustness red lines:
+            - No silent except blocks; every except returns or logs with type
+              and message. CancelledError must be re-raised when the current
+              task was externally cancelled (the /stop pattern).
+            - No setTimeout/asyncio.sleep used to fake async; only real
+              awaits.
+            - asyncio.create_task spawned tasks should be tracked (so
+              shutdown can drain them) — orphan tasks leak.
+            - No mock-only tests for SDK transports (streamable_http_client,
+              ClientSession, sse_client, stdio_client). Pure-mock coverage is
+              a documented false-positive class for this codebase (see
+              tests/agent/test_mcp_pool_real_transport.py for the
+              real-transport pattern).
+
+            Email channel:
+            - sender → admin._id resolution via salesperson.lookup_by_email
+              must happen BEFORE dispatching to the agent loop, and the
+              result must be propagated as metadata['_acting_as'].
+            - Unknown senders must trigger an unknown-sender reply and NOT
+              dispatch to the agent (no doc creation).
+            - IMAP UNSEEN race: appended emails sometimes carry \Seen
+              automatically (Zoho); test harnesses must explicitly pass
+              empty flags on append.
+
+            Comment style:
+            - Be terse. One short paragraph per issue.
+            - Use inline comments for line-specific issues; sticky summary
+              for cross-cutting findings.
+            - Skip comments on .md files, fixtures, lockfiles.
+            - If the PR looks clean, say so in one sentence.
+          claude_args: |
+            --max-turns 12
