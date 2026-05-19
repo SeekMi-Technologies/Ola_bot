@@ -10,9 +10,14 @@ from loguru import logger
 class OpenAITranscriptionProvider:
     """Voice transcription provider using OpenAI's audio API.
 
-    Supports the newer gpt-4o-transcribe family (incl. -diarize variant which
+    Supports the gpt-4o-transcribe family (incl. -diarize variant which
     returns speaker-labeled timestamped segments via response_format=diarized_json)
-    and the legacy whisper-1 model. Default is gpt-4o-transcribe-diarize.
+    and the legacy whisper-1 model.
+
+    Default is gpt-4o-transcribe (plain text output) — appropriate for
+    single-speaker delivery channels (WhatsApp voice messages, Telegram, etc.).
+    Callers needing speaker diarization (e.g. sales-coach pipeline analyzing
+    multi-party calls) explicitly pass model="gpt-4o-transcribe-diarize".
     """
 
     def __init__(
@@ -34,7 +39,7 @@ class OpenAITranscriptionProvider:
         self.model = (
             model
             or os.environ.get("OPENAI_TRANSCRIPTION_MODEL")
-            or "gpt-4o-transcribe-diarize"
+            or "gpt-4o-transcribe"
         )
         if "diarize" in self.model and chunking_strategy is None:
             chunking_strategy = "auto"

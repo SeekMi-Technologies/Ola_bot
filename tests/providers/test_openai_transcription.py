@@ -50,9 +50,16 @@ def test_format_diarized_defensive_against_missing_fields() -> None:
     assert result == "? 00:00  \nA 00:00  ok"
 
 
-def test_init_default_model_is_diarize(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_default_model_is_plain_transcribe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_TRANSCRIPTION_MODEL", raising=False)
     p = OpenAITranscriptionProvider(api_key="sk-test")
+    assert p.model == "gpt-4o-transcribe"
+    assert p.chunking_strategy is None
+
+
+def test_init_explicit_diarize_auto_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_TRANSCRIPTION_MODEL", raising=False)
+    p = OpenAITranscriptionProvider(api_key="sk-test", model="gpt-4o-transcribe-diarize")
     assert p.model == "gpt-4o-transcribe-diarize"
     assert p.chunking_strategy == "auto"
 
@@ -120,7 +127,9 @@ async def test_transcribe_diarize_sends_correct_payload(tmp_path: Path) -> None:
     with patch(
         "nanobot.providers.transcription.httpx.AsyncClient", return_value=async_client
     ):
-        p = OpenAITranscriptionProvider(api_key="sk-test")
+        p = OpenAITranscriptionProvider(
+            api_key="sk-test", model="gpt-4o-transcribe-diarize"
+        )
         result = await p.transcribe(audio)
 
     assert client_instance.post.called
@@ -131,6 +140,26 @@ async def test_transcribe_diarize_sends_correct_payload(tmp_path: Path) -> None:
     assert files["chunking_strategy"] == (None, "auto")
     assert call_kwargs["headers"]["Authorization"] == "Bearer sk-test"
     assert result == "A 00:00  Hello"
+
+
+async def test_transcribe_default_plain_payload_no_chunking(tmp_path: Path) -> None:
+    audio = tmp_path / "test.wav"
+    audio.write_bytes(b"fake audio")
+
+    json_response = {"text": "Hello there, just confirming tomorrow."}
+    async_client, client_instance = _make_mock_client(json_response)
+
+    with patch(
+        "nanobot.providers.transcription.httpx.AsyncClient", return_value=async_client
+    ):
+        p = OpenAITranscriptionProvider(api_key="sk-test")  # default model
+        result = await p.transcribe(audio)
+
+    files = client_instance.post.call_args.kwargs["files"]
+    assert files["model"] == (None, "gpt-4o-transcribe")
+    assert files["response_format"] == (None, "json")
+    assert "chunking_strategy" not in files
+    assert result == "Hello there, just confirming tomorrow."
 
 
 async def test_transcribe_whisper1_legacy_path_no_chunking(tmp_path: Path) -> None:
