@@ -1,8 +1,11 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-# Install Node.js 20 for the WhatsApp bridge
+# System deps:
+# - Node.js 20: WhatsApp bridge (Baileys)
+# - ffmpeg: transcribe_audio agent tool compresses large audio files to
+#   mono 16k MP3 to fit OpenAI's 25MB upload cap before transcription.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates gnupg git bubblewrap openssh-client && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg git bubblewrap openssh-client ffmpeg && \
     mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
