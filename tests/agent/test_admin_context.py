@@ -53,6 +53,46 @@ def test_surrounding_whitespace_trimmed():
     assert get_acting_admin_id() == "abc123"
 
 
+@pytest.mark.parametrize(
+    "evil",
+    [
+        "../../../etc",
+        "admin-A/../admin-B",
+        "/absolute/path",
+        "\\windows\\path",
+        "with spaces",
+        "name.with.dots",
+        "name\x00null",
+        "..",
+        "../sibling",
+        "a" * 200,  # over 128-char cap
+    ],
+)
+def test_path_traversal_payloads_rejected(evil):
+    """An attacker-controlled X-Ola-Acting-As header must not be able to
+    redirect workspace mkdir outside admins/<safe>/. Reject anything
+    that does not match [A-Za-z0-9_-]{1,128}."""
+    set_acting_admin_id(evil)
+    assert get_acting_admin_id() is None
+    assert get_admin_dir_name() == SYSTEM_ADMIN_ID
+
+
+@pytest.mark.parametrize(
+    "ok",
+    [
+        "699245d5c692e668ea7ab155",  # Mongo ObjectId hex
+        "admin-A",                    # hyphenated test fixture
+        "_system",                    # sentinel itself
+        "Tester_001",
+        "ABC123xyz",
+        "a",                          # single char OK
+    ],
+)
+def test_safe_admin_ids_accepted(ok):
+    set_acting_admin_id(ok)
+    assert get_acting_admin_id() == ok
+
+
 def test_with_acting_admin_id_restores_on_exit():
     set_acting_admin_id("outer-admin")
     with with_acting_admin_id("inner-admin"):

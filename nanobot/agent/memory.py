@@ -740,20 +740,30 @@ class Dream:
     # -- tool registry -------------------------------------------------------
 
     def _build_tools(self) -> ToolRegistry:
-        """Build a minimal tool registry for the Dream agent."""
+        """Build a minimal tool registry for the Dream agent.
+
+        Read/Edit scoped to acting admin's subtree (Ola N2 #254 hardening) so
+        a prompt-injected history entry can't redirect Dream's LLM to read
+        another admin's MEMORY.md. WriteFile stays scoped to the global
+        skills/ dir — Dream-created skills are shared across admins by design.
+        """
+        from nanobot.agent.admin_context import get_admin_dir_name
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
 
         tools = ToolRegistry()
         workspace = self.store.workspace
-        # Allow reading builtin skills for reference during skill creation
+
+        def admin_workspace() -> Path:
+            return workspace / "admins" / get_admin_dir_name()
+
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
         tools.register(ReadFileTool(
-            workspace=workspace,
-            allowed_dir=workspace,
+            workspace=admin_workspace,
+            allowed_dir=admin_workspace,
             extra_allowed_dirs=extra_read,
         ))
-        tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
+        tools.register(EditFileTool(workspace=admin_workspace, allowed_dir=admin_workspace))
         # write_file resolves relative paths from workspace root, but can only
         # write under skills/ so the prompt can safely use skills/<name>/SKILL.md.
         skills_dir = workspace / "skills"
@@ -801,8 +811,13 @@ class Dream:
         (which can happen with an uncommitted working-tree edit — better to
         skip annotation than to tag the wrong line).
         SOUL.md and USER.md are never annotated.
+
+        Ola N2: file_path is admin-scoped (admins/<adminId>/memory/MEMORY.md).
+        GitStore currently only tracks SOUL.md, so line_ages returns []
+        and annotation is silently skipped — the path is correct for the
+        future if per-admin git tracking is reintroduced.
         """
-        file_path = "memory/MEMORY.md"
+        file_path = str(self.store.memory_file.relative_to(self.store.workspace))
         try:
             ages = self.store.git.line_ages(file_path)
         except Exception:

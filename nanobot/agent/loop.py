@@ -310,24 +310,24 @@ class AgentLoop:
         """Register the default set of tools.
 
         Ola N2 (#254 #246): filesystem tools see workspace/admins/<adminId>/
-        per the acting-admin ContextVar. Without this, ReadFileTool/GrepTool
-        could read workspace/admins/<other>/sessions/*.jsonl across admins.
-        BUILTIN_SKILLS_DIR stays globally readable (read-only, no leak).
+        per the acting-admin ContextVar. allowed_dir is ALWAYS scoped to
+        the acting admin's subtree — admin isolation is a security
+        invariant, not a sandboxing preference. restrict_to_workspace only
+        controls whether BUILTIN_SKILLS_DIR is added as a readable extra.
         """
         from nanobot.agent.admin_context import get_admin_dir_name
 
-        gate_allowed = self.restrict_to_workspace or self.exec_config.sandbox
         workspace_root = self.workspace
 
         def admin_workspace() -> Path:
             return workspace_root / "admins" / get_admin_dir_name()
 
-        allowed_dir_factory = admin_workspace if gate_allowed else None
-        # ContextVar-driven workspace for relative-path resolution; same
-        # subtree as allowed_dir so an agent's `read_file("memory/...")`
-        # lands in its own admin dir.
+        # Always per-admin — no opt-out. Conditional gating only chose
+        # whether BUILTIN_SKILLS_DIR appears as extra_allowed (read-only).
+        allowed_dir_factory = admin_workspace
         workspace_factory = admin_workspace
-        extra_read = [BUILTIN_SKILLS_DIR] if gate_allowed else None
+        gate_skills = self.restrict_to_workspace or self.exec_config.sandbox
+        extra_read = [BUILTIN_SKILLS_DIR] if gate_skills else None
         self.tools.register(AskUserTool())
         self.tools.register(
             ReadFileTool(
