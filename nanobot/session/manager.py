@@ -10,6 +10,11 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.admin_context import (
+    SYSTEM_ADMIN_ID,
+    get_admin_dir_name,
+    with_acting_admin_id,
+)
 from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.utils.helpers import (
     ensure_dir,
@@ -120,8 +125,9 @@ class SessionManager:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
+        # Cache key is `f"{admin_dir}|{session_key}"` so two admins replying
+        # to the same channel chat_id never share a cached Session object.
         self._cache: dict[str, Session] = {}
 
     @staticmethod
@@ -129,8 +135,18 @@ class SessionManager:
         """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem."""
         return safe_filename(key.replace(":", "_"))
 
+    @property
+    def sessions_dir(self) -> Path:
+        """Per-admin sessions directory, resolved from the ContextVar set by
+        api/server.py from X-Ola-Acting-As. Falls back to admins/_system/
+        when no admin context is present."""
+        return ensure_dir(self.workspace / "admins" / get_admin_dir_name() / "sessions")
+
+    def _cache_key(self, session_key: str) -> str:
+        return f"{get_admin_dir_name()}|{session_key}"
+
     def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
+        """Get the file path for a session under the current admin's dir."""
         return self.sessions_dir / f"{self.safe_key(key)}.jsonl"
 
     def _get_legacy_session_path(self, key: str) -> Path:
@@ -147,14 +163,15 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        cache_key = self._cache_key(key)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         session = self._load(key)
         if session is None:
             session = Session(key=key)
 
-        self._cache[key] = session
+        self._cache[cache_key] = session
         return session
 
     def _load(self, key: str) -> Session | None:
@@ -311,6 +328,8 @@ class SessionManager:
 
             os.replace(tmp_path, path)
 
+            self._cache[self._cache_key(session.key)] = session
+
             if fsync:
                 # fsync the directory so the rename is durable.
                 # On Windows, opening a directory with O_RDONLY raises
@@ -328,8 +347,6 @@ class SessionManager:
             tmp_path.unlink(missing_ok=True)
             raise
 
-        self._cache[session.key] = session
-
     def flush_all(self) -> int:
         """Re-save every cached session with fsync for durable shutdown.
 
@@ -338,17 +355,20 @@ class SessionManager:
         flushed.
         """
         flushed = 0
-        for key, session in list(self._cache.items()):
+        for cache_key, session in list(self._cache.items()):
+            admin_dir, _, _ = cache_key.partition("|")
+            scoped = admin_dir if admin_dir != SYSTEM_ADMIN_ID else None
             try:
-                self.save(session, fsync=True)
+                with with_acting_admin_id(scoped):
+                    self.save(session, fsync=True)
                 flushed += 1
             except Exception:
-                logger.warning("Failed to flush session {}", key, exc_info=True)
+                logger.warning("Failed to flush session {}", cache_key, exc_info=True)
         return flushed
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
-        self._cache.pop(key, None)
+        self._cache.pop(self._cache_key(key), None)
 
     def delete_session(self, key: str) -> bool:
         """Remove a session from disk and the in-memory cache.

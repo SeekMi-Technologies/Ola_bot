@@ -16,7 +16,9 @@ from nanobot.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    # Bootstrap files read from workspace root (global / per-tenant).
+    # USER.md is per-admin and loaded via self.memory.user_file instead.
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -68,12 +70,19 @@ class ContextBuilder:
     def _get_identity(self, channel: str | None = None) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
+        # Memory/history paths the agent sees match what its filesystem tools
+        # actually resolve to (per-admin via ContextVar, Ola N2). Without this,
+        # the agent reads "your memory is at .../memory/MEMORY.md" but the
+        # tools resolve relative paths under .../admins/<adminId>/memory/...,
+        # creating a confusing path mismatch.
+        memory_dir_path = str(self.memory.memory_dir.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
+            memory_dir_path=memory_dir_path,
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
@@ -107,7 +116,7 @@ class ContextBuilder:
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load global workspace bootstrap files + per-admin USER.md."""
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
@@ -115,6 +124,11 @@ class ContextBuilder:
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
+
+        user_file = self.memory.user_file
+        if user_file.exists():
+            content = user_file.read_text(encoding="utf-8")
+            parts.append(f"## USER.md\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 

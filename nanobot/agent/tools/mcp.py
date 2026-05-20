@@ -11,34 +11,18 @@ import os
 import shutil
 from collections import OrderedDict
 from contextlib import AsyncExitStack
-from contextvars import ContextVar
 from typing import Any
 
 import httpx
 from loguru import logger
 
+from nanobot.agent.admin_context import (
+    _acting_admin_ctx as _acting_as_ctx,
+    get_acting_as,
+    set_acting_as,
+)
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
-
-# Carries the current request's acting-as admin._id from the chat completions
-# entry point (api/server.py reads X-Ola-Acting-As) or channel _dispatch
-# (msg.metadata['_acting_as']) down to MCPToolWrapper.execute, which keys the
-# pool by this value to pick the right transport.
-_acting_as_ctx: ContextVar[str | None] = ContextVar("ola_acting_as", default=None)
-
-
-def set_acting_as(value: str | None) -> None:
-    """Store the current request's acting-as identity. Empty/whitespace/non-
-    string normalize to None so we never propagate junk."""
-    if value is None or not isinstance(value, str):
-        _acting_as_ctx.set(None)
-        return
-    trimmed = value.strip()
-    _acting_as_ctx.set(trimmed if trimmed else None)
-
-
-def get_acting_as() -> str | None:
-    return _acting_as_ctx.get()
 
 
 _TRANSIENT_EXC_NAMES: frozenset[str] = frozenset((

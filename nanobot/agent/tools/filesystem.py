@@ -5,7 +5,7 @@ import mimetypes
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
@@ -14,22 +14,39 @@ from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 from nanobot.config.paths import get_media_dir
 
 
+PathOrFactory = Path | Callable[[], Path] | None
+
+
+def _eval_path(p: PathOrFactory) -> Path | None:
+    """Evaluate a Path-or-factory at call time. None stays None.
+
+    Lets filesystem tools accept either a fixed Path (legacy / tests) or
+    a zero-arg callable that resolves the path per-request (Ola N2 — the
+    callable reads the acting-admin ContextVar and returns the admin's
+    workspace subtree)."""
+    if p is None:
+        return None
+    return p() if callable(p) else p
+
+
 def _resolve_path(
     path: str,
-    workspace: Path | None = None,
-    allowed_dir: Path | None = None,
+    workspace: PathOrFactory = None,
+    allowed_dir: PathOrFactory = None,
     extra_allowed_dirs: list[Path] | None = None,
 ) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
+    workspace_p = _eval_path(workspace)
+    allowed_p = _eval_path(allowed_dir)
     p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
-        p = workspace / p
+    if not p.is_absolute() and workspace_p:
+        p = workspace_p / p
     resolved = p.resolve()
-    if allowed_dir:
+    if allowed_p:
         media_path = get_media_dir().resolve()
-        all_dirs = [allowed_dir] + [media_path] + (extra_allowed_dirs or []) 
+        all_dirs = [allowed_p] + [media_path] + (extra_allowed_dirs or [])
         if not any(_is_under(resolved, d) for d in all_dirs):
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+            raise PermissionError(f"Path {path} is outside allowed directory {allowed_p}")
     return resolved
 
 
@@ -42,12 +59,18 @@ def _is_under(path: Path, directory: Path) -> bool:
 
 
 class _FsTool(Tool):
-    """Shared base for filesystem tools — common init and path resolution."""
+    """Shared base for filesystem tools — common init and path resolution.
+
+    `workspace` and `allowed_dir` accept either a fixed Path (legacy / tests)
+    or a zero-arg callable that resolves per-request. Used by Ola N2 to
+    scope tools to workspace/admins/<adminId>/ per the acting-admin
+    ContextVar without re-instantiating tools on every request.
+    """
 
     def __init__(
         self,
-        workspace: Path | None = None,
-        allowed_dir: Path | None = None,
+        workspace: PathOrFactory = None,
+        allowed_dir: PathOrFactory = None,
         extra_allowed_dirs: list[Path] | None = None,
     ):
         self._workspace = workspace
