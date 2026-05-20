@@ -1,8 +1,14 @@
-"""Tests for OpenAITranscriptionProvider with gpt-4o-transcribe-diarize support."""
+"""Tests for OpenAITranscriptionProvider — real-time channel STT path.
+
+Diarized output (multi-speaker labeled segments) was removed in May 2026;
+bulk multi-speaker transcription now lives in Ola CRM's transcriptionWorker.
+nanobot's provider only handles single-speaker delivery-channel audio.
+"""
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from nanobot.providers.transcription import OpenAITranscriptionProvider
@@ -22,66 +28,21 @@ def _make_mock_client(json_response: dict):
     return async_client, client_instance
 
 
-def test_format_diarized_renders_segments() -> None:
-    data = {
-        "text": "ignored when segments present",
-        "segments": [
-            {"speaker": "A", "start": 3.412, "end": 5.312, "text": "Hello there"},
-            {"speaker": "B", "start": 65.0, "end": 67.0, "text": "Hi back"},
-        ],
-    }
-    result = OpenAITranscriptionProvider._format_diarized(data)
-    assert result.split("\n") == ["A 00:03  Hello there", "B 01:05  Hi back"]
-
-
-def test_format_diarized_empty_segments_falls_back_to_text() -> None:
-    assert OpenAITranscriptionProvider._format_diarized(
-        {"text": "fallback", "segments": []}
-    ) == "fallback"
-
-
-def test_format_diarized_missing_segments_falls_back_to_text() -> None:
-    assert OpenAITranscriptionProvider._format_diarized({"text": "fallback"}) == "fallback"
-
-
-def test_format_diarized_defensive_against_missing_fields() -> None:
-    data = {"segments": [{}, {"speaker": "A", "text": "ok"}]}
-    result = OpenAITranscriptionProvider._format_diarized(data)
-    assert result == "? 00:00  \nA 00:00  ok"
-
-
 def test_init_default_model_is_plain_transcribe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_TRANSCRIPTION_MODEL", raising=False)
     p = OpenAITranscriptionProvider(api_key="sk-test")
     assert p.model == "gpt-4o-transcribe"
-    assert p.chunking_strategy is None
 
 
-def test_init_explicit_diarize_auto_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_TRANSCRIPTION_MODEL", raising=False)
-    p = OpenAITranscriptionProvider(api_key="sk-test", model="gpt-4o-transcribe-diarize")
-    assert p.model == "gpt-4o-transcribe-diarize"
-    assert p.chunking_strategy == "auto"
-
-
-def test_init_explicit_whisper1_no_chunking() -> None:
+def test_init_explicit_whisper1() -> None:
     p = OpenAITranscriptionProvider(api_key="sk-test", model="whisper-1")
     assert p.model == "whisper-1"
-    assert p.chunking_strategy is None
 
 
 def test_init_env_var_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
     p = OpenAITranscriptionProvider(api_key="sk-test")
     assert p.model == "gpt-4o-mini-transcribe"
-    assert p.chunking_strategy is None
-
-
-def test_init_explicit_chunking_strategy_respected() -> None:
-    p = OpenAITranscriptionProvider(
-        api_key="sk-test", model="gpt-4o-transcribe-diarize", chunking_strategy="server_vad"
-    )
-    assert p.chunking_strategy == "server_vad"
 
 
 def test_init_timeout_default_300s(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,35 +75,7 @@ async def test_transcribe_file_not_found_returns_empty(tmp_path: Path) -> None:
     assert result == ""
 
 
-async def test_transcribe_diarize_sends_correct_payload(tmp_path: Path) -> None:
-    audio = tmp_path / "test.wav"
-    audio.write_bytes(b"fake audio bytes")
-
-    json_response = {
-        "text": "Hello",
-        "segments": [{"speaker": "A", "start": 0.0, "end": 1.0, "text": "Hello"}],
-    }
-    async_client, client_instance = _make_mock_client(json_response)
-
-    with patch(
-        "nanobot.providers.transcription.httpx.AsyncClient", return_value=async_client
-    ):
-        p = OpenAITranscriptionProvider(
-            api_key="sk-test", model="gpt-4o-transcribe-diarize"
-        )
-        result = await p.transcribe(audio)
-
-    assert client_instance.post.called
-    call_kwargs = client_instance.post.call_args.kwargs
-    files = call_kwargs["files"]
-    assert files["model"] == (None, "gpt-4o-transcribe-diarize")
-    assert files["response_format"] == (None, "diarized_json")
-    assert files["chunking_strategy"] == (None, "auto")
-    assert call_kwargs["headers"]["Authorization"] == "Bearer sk-test"
-    assert result == "A 00:00  Hello"
-
-
-async def test_transcribe_default_plain_payload_no_chunking(tmp_path: Path) -> None:
+async def test_transcribe_default_plain_payload(tmp_path: Path) -> None:
     audio = tmp_path / "test.wav"
     audio.write_bytes(b"fake audio")
 
@@ -162,7 +95,7 @@ async def test_transcribe_default_plain_payload_no_chunking(tmp_path: Path) -> N
     assert result == "Hello there, just confirming tomorrow."
 
 
-async def test_transcribe_whisper1_legacy_path_no_chunking(tmp_path: Path) -> None:
+async def test_transcribe_whisper1_legacy_path(tmp_path: Path) -> None:
     audio = tmp_path / "test.wav"
     audio.write_bytes(b"fake audio")
 
@@ -178,7 +111,6 @@ async def test_transcribe_whisper1_legacy_path_no_chunking(tmp_path: Path) -> No
     files = client_instance.post.call_args.kwargs["files"]
     assert files["model"] == (None, "whisper-1")
     assert files["response_format"] == (None, "json")
-    assert "chunking_strategy" not in files
     assert result == "plain transcript output"
 
 
@@ -186,7 +118,7 @@ async def test_transcribe_language_param_passed(tmp_path: Path) -> None:
     audio = tmp_path / "test.wav"
     audio.write_bytes(b"fake")
 
-    async_client, client_instance = _make_mock_client({"text": "", "segments": []})
+    async_client, client_instance = _make_mock_client({"text": ""})
 
     with patch(
         "nanobot.providers.transcription.httpx.AsyncClient", return_value=async_client
@@ -204,6 +136,34 @@ async def test_transcribe_api_error_returns_empty(tmp_path: Path) -> None:
 
     response = MagicMock()
     response.raise_for_status = MagicMock(side_effect=Exception("HTTP 500"))
+    client_instance = MagicMock()
+    client_instance.post = AsyncMock(return_value=response)
+    async_client = MagicMock()
+    async_client.__aenter__ = AsyncMock(return_value=client_instance)
+    async_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "nanobot.providers.transcription.httpx.AsyncClient", return_value=async_client
+    ):
+        p = OpenAITranscriptionProvider(api_key="sk-test")
+        result = await p.transcribe(audio)
+
+    assert result == ""
+
+
+async def test_transcribe_http_status_error_returns_empty(tmp_path: Path) -> None:
+    """HTTPStatusError has a dedicated except branch that logs response body
+    + status — covered separately from the generic Exception path."""
+    audio = tmp_path / "test.wav"
+    audio.write_bytes(b"fake")
+
+    err_response = MagicMock()
+    err_response.status_code = 429
+    err_response.text = "rate limited"
+    response = MagicMock()
+    response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("rate limited", request=MagicMock(), response=err_response)
+    )
     client_instance = MagicMock()
     client_instance.post = AsyncMock(return_value=response)
     async_client = MagicMock()
