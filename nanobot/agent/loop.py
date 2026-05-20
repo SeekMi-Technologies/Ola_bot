@@ -307,22 +307,40 @@ class AgentLoop:
         register_builtin_commands(self.commands)
 
     def _register_default_tools(self) -> None:
-        """Register the default set of tools."""
-        allowed_dir = (
-            self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
-        )
-        extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
+        """Register the default set of tools.
+
+        Ola N2 (#254 #246): filesystem tools see workspace/admins/<adminId>/
+        per the acting-admin ContextVar. Without this, ReadFileTool/GrepTool
+        could read workspace/admins/<other>/sessions/*.jsonl across admins.
+        BUILTIN_SKILLS_DIR stays globally readable (read-only, no leak).
+        """
+        from nanobot.agent.admin_context import get_admin_dir_name
+
+        gate_allowed = self.restrict_to_workspace or self.exec_config.sandbox
+        workspace_root = self.workspace
+
+        def admin_workspace() -> Path:
+            return workspace_root / "admins" / get_admin_dir_name()
+
+        allowed_dir_factory = admin_workspace if gate_allowed else None
+        # ContextVar-driven workspace for relative-path resolution; same
+        # subtree as allowed_dir so an agent's `read_file("memory/...")`
+        # lands in its own admin dir.
+        workspace_factory = admin_workspace
+        extra_read = [BUILTIN_SKILLS_DIR] if gate_allowed else None
         self.tools.register(AskUserTool())
         self.tools.register(
             ReadFileTool(
-                workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
+                workspace=workspace_factory,
+                allowed_dir=allowed_dir_factory,
+                extra_allowed_dirs=extra_read,
             )
         )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+            self.tools.register(cls(workspace=workspace_factory, allowed_dir=allowed_dir_factory))
         for cls in (GlobTool, GrepTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            self.tools.register(cls(workspace=workspace_factory, allowed_dir=allowed_dir_factory))
+        self.tools.register(NotebookEditTool(workspace=workspace_factory, allowed_dir=allowed_dir_factory))
         if self.exec_config.enable:
             self.tools.register(
                 ExecTool(
