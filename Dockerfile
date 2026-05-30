@@ -1,6 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-# Install Node.js 20 for the WhatsApp bridge
+# System deps:
+# - Node.js 20: WhatsApp bridge (Baileys)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git bubblewrap openssh-client && \
     mkdir -p /etc/apt/keyrings && \

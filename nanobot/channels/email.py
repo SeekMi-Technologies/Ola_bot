@@ -3,9 +3,13 @@
 import asyncio
 import html
 import imaplib
+import json
+import os
 import re
 import smtplib
 import ssl
+
+import httpx
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
@@ -25,6 +29,12 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
+
+# Box2 (ai role) runs the email channel but Box1 (app role) hosts MCP, so the
+# loopback default only works for single-box dev. Prod must set OLA_MCP_URL
+# (e.g. http://100.109.220.126:8889/mcp via Tailscale) on the gateway service.
+# Closes Ola#204.
+_OLA_MCP_URL = os.environ.get("OLA_MCP_URL", "http://127.0.0.1:8889/mcp")
 
 
 class EmailConfig(Base):
@@ -54,6 +64,10 @@ class EmailConfig(Base):
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
     allow_from: list[str] = Field(default_factory=list)
+    unknown_sender_message: str = (
+        "Unknown sender — please contact your administrator to be added before "
+        "emailing this address again."
+    )
 
     # Email authentication verification (anti-spoofing)
     verify_dkim: bool = True   # Require Authentication-Results with dkim=pass
@@ -159,12 +173,29 @@ class EmailChannel(BaseChannel):
                     if message_id:
                         self._last_message_id_by_chat[sender] = message_id
 
+                    try:
+                        admin_id = await self._resolve_sender_acting_as(sender)
+                    except Exception as e:
+                        logger.error(
+                            "Email pre-lookup failed for {} — dropping email "
+                            "(no reply, no agent dispatch): {}",
+                            sender, e,
+                        )
+                        continue
+
+                    if admin_id is None:
+                        await self._send_unknown_sender_reply(sender)
+                        continue
+
+                    item_metadata = dict(item.get("metadata") or {})
+                    item_metadata["_acting_as"] = admin_id
+
                     await self._handle_message(
                         sender_id=sender,
                         chat_id=sender,
                         content=item["content"],
                         media=item.get("media") or None,
-                        metadata=item.get("metadata", {}),
+                        metadata=item_metadata,
                     )
             except Exception as e:
                 logger.error("Email polling error: {}", e)
@@ -179,6 +210,16 @@ class EmailChannel(BaseChannel):
         """Send email via SMTP."""
         if not self.config.consent_granted:
             logger.warning("Skip email send: consent_granted is false")
+            return
+
+        # Drop streaming-UI progress messages. agent.loop publishes one
+        # OutboundMessage per tool-call iteration with metadata._progress
+        # (or _tool_hint / _retry_wait) so a real-time chat UI can render
+        # a live trace. Email is delivery-grade, not streaming — sending
+        # each iteration produces a 30-40x spam amplification on top of
+        # the final response. Final responses do not carry these flags.
+        meta = msg.metadata or {}
+        if meta.get("_progress") or meta.get("_tool_hint") or meta.get("_retry_wait"):
             return
 
         if not self.config.smtp_host:
@@ -222,6 +263,115 @@ class EmailChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending email to {}: {}", to_addr, e)
             raise
+
+    async def _resolve_sender_acting_as(self, sender: str) -> str | None:
+        """Return admin._id for known sender, None for unknown, raise on error.
+
+        Wrapped in asyncio.wait_for so a stuck MCP server can never block the
+        IMAP polling loop indefinitely. Exceeded timeout raises asyncio.
+        TimeoutError, which the caller already treats as a transient pre-lookup
+        failure (drops the email without dispatching to the agent).
+        """
+        return await asyncio.wait_for(self._resolve_sender_acting_as_inner(sender), timeout=10.0)
+
+    async def _resolve_sender_acting_as_inner(self, sender: str) -> str | None:
+        token = os.environ.get("MCP_SERVICE_TOKEN")
+        if not token:
+            raise RuntimeError(
+                "MCP_SERVICE_TOKEN env var is not set — required for email "
+                "channel sender pre-lookup"
+            )
+
+        # Use the non-deprecated SDK entry point; build our own httpx client
+        # so the Authorization header (and timeout) are connection-level rather
+        # than passed through SDK kwargs that the deprecated wrapper exposes.
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+        ) as http_client:
+            async with streamable_http_client(
+                _OLA_MCP_URL,
+                http_client=http_client,
+            ) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(
+                        "salesperson.lookup_by_email",
+                        {"email": sender},
+                    )
+
+        if result.isError:
+            raise RuntimeError(
+                f"MCP salesperson.lookup_by_email returned isError for "
+                f"sender={sender}: {result.content}"
+            )
+        if not result.content:
+            raise RuntimeError(
+                f"MCP salesperson.lookup_by_email returned empty content for "
+                f"sender={sender}"
+            )
+
+        text = getattr(result.content[0], "text", None)
+        if not text:
+            raise RuntimeError(
+                f"MCP salesperson.lookup_by_email first content block has no "
+                f"text for sender={sender}"
+            )
+        envelope = json.loads(text)
+        if not envelope.get("ok"):
+            raise RuntimeError(
+                f"MCP salesperson.lookup_by_email envelope ok=false for "
+                f"sender={sender}: {envelope.get('message')}"
+            )
+
+        data = envelope.get("data") or {}
+        if not data.get("found"):
+            return None
+
+        sp = data.get("salesperson") or {}
+        admin_id = sp.get("_id")
+        if not isinstance(admin_id, str) or not admin_id.strip():
+            raise RuntimeError(
+                f"MCP salesperson.lookup_by_email returned no _id for "
+                f"sender={sender}"
+            )
+        return admin_id
+
+    async def _send_unknown_sender_reply(self, sender: str) -> None:
+        """SMTP-reply unknown_sender_message; do not publish to bus."""
+        if not self.config.smtp_host:
+            logger.warning(
+                "Cannot send unknown-sender reply to {} — SMTP host not "
+                "configured", sender,
+            )
+            return
+
+        base_subject = self._last_subject_by_chat.get(sender, "Email received")
+        email_msg = EmailMessage()
+        email_msg["From"] = (
+            self.config.from_address
+            or self.config.smtp_username
+            or self.config.imap_username
+        )
+        email_msg["To"] = sender
+        email_msg["Subject"] = self._reply_subject(base_subject)
+        email_msg.set_content(self.config.unknown_sender_message)
+
+        in_reply_to = self._last_message_id_by_chat.get(sender)
+        if in_reply_to:
+            email_msg["In-Reply-To"] = in_reply_to
+            email_msg["References"] = in_reply_to
+
+        try:
+            await asyncio.to_thread(self._smtp_send, email_msg)
+            logger.info("Sent unknown-sender reply to {}", sender)
+        except Exception as e:
+            logger.error(
+                "Failed to send unknown-sender reply to {}: {}", sender, e,
+            )
 
     def _validate_config(self) -> bool:
         missing = []

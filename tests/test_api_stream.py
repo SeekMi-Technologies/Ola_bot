@@ -12,6 +12,7 @@ import pytest_asyncio
 from nanobot.api.server import (
     _sse_chunk,
     _sse_tool_event,
+    _sse_usage,
     _SSE_DONE,
     create_app,
 )
@@ -477,3 +478,156 @@ async def test_tool_event_with_error_phase_propagates(aiohttp_client) -> None:
     assert "event: tool_event" in body
     assert '"phase": "error"' in body
     assert '"error": "MCP server unreachable"' in body
+
+
+# ---------------------------------------------------------------------------
+# Ola CRM #98 — `event: usage` SSE frame
+# ---------------------------------------------------------------------------
+
+
+_USAGE_HAPPY = {
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite-preview",
+    "prompt_tokens": 1234,
+    "completion_tokens": 567,
+    "total_tokens": 1801,
+    "cached_tokens": 120,
+    "iterations": 1,
+}
+
+
+def _make_streaming_agent_with_usage(tokens: list[str], usage: dict | None) -> MagicMock:
+    """Mock agent that, after streaming tokens, sets _last_usage on itself."""
+    agent = MagicMock()
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+    # Pre-configure _last_usage as None so the production guard sees a real
+    # dict only after process_direct runs.
+    agent._last_usage = {}
+
+    async def fake_process_direct(*, content="", media=None, session_key="",
+                                  channel="", chat_id="", on_stream=None,
+                                  on_stream_end=None, **kwargs):
+        if on_stream:
+            for token in tokens:
+                await on_stream(token)
+        if on_stream_end:
+            await on_stream_end()
+        # Mirror what real AgentLoop._run_agent_loop does: set _last_usage
+        # after the inner runner finishes, before process_direct returns.
+        if usage is not None:
+            agent._last_usage = dict(usage)
+        return " ".join(tokens)
+
+    agent.process_direct = fake_process_direct
+    return agent
+
+
+def test_sse_usage_helper_format() -> None:
+    raw = _sse_usage(_USAGE_HAPPY)
+    line = raw.decode()
+    assert line.startswith("event: usage\ndata: ")
+    payload_json = line[len("event: usage\ndata: "):].rstrip("\n")
+    payload = json.loads(payload_json)
+    assert payload == _USAGE_HAPPY
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_emits_usage_frame_with_all_seven_fields(aiohttp_client) -> None:
+    """Happy path: response stream includes `event: usage` with full schema."""
+    agent = _make_streaming_agent_with_usage(["Hello", " world"], _USAGE_HAPPY)
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    body = await resp.text()
+
+    # Find the usage frame: event:usage followed by its data line
+    assert "event: usage\n" in body
+    blocks = body.split("\n\n")
+    usage_blocks = [b for b in blocks if b.startswith("event: usage")]
+    assert len(usage_blocks) == 1, f"Expected exactly one usage frame, got {len(usage_blocks)}"
+    data_line = next(l for l in usage_blocks[0].split("\n") if l.startswith("data: "))
+    payload = json.loads(data_line[len("data: "):])
+    assert set(payload.keys()) == {
+        "provider", "model", "prompt_tokens", "completion_tokens",
+        "total_tokens", "cached_tokens", "iterations",
+    }
+    assert payload == _USAGE_HAPPY
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_usage_frame_for_tool_using_turn_iterations_two(aiohttp_client) -> None:
+    """Tool-using turn: iterations >= 2 surfaces in the usage frame."""
+    usage = dict(_USAGE_HAPPY)
+    usage["iterations"] = 3
+    agent = _make_streaming_agent_with_usage(["answer"], usage)
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "do task"}], "stream": True},
+    )
+    body = await resp.text()
+
+    blocks = body.split("\n\n")
+    usage_blocks = [b for b in blocks if b.startswith("event: usage")]
+    data_line = next(l for l in usage_blocks[0].split("\n") if l.startswith("data: "))
+    payload = json.loads(data_line[len("data: "):])
+    assert payload["iterations"] == 3
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_no_usage_when_last_usage_empty(aiohttp_client) -> None:
+    """Legacy edge: _last_usage stays empty → no usage frame, [DONE] still arrives."""
+    agent = _make_streaming_agent_with_usage(["hi"], None)  # never sets _last_usage
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    body = await resp.text()
+
+    assert "event: usage" not in body
+    assert "[DONE]" in body  # stream still terminates cleanly
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_stream_emits_usage_even_on_error_when_partial_collected(aiohttp_client) -> None:
+    """If process_direct raises but _last_usage was populated mid-stream,
+    we still emit usage so cost-tracking captures the wasted tokens."""
+    agent = MagicMock()
+    agent._connect_mcp = AsyncMock()
+    agent.close_mcp = AsyncMock()
+    # Simulate a turn where partial usage was collected before the error
+    agent._last_usage = {**_USAGE_HAPPY, "iterations": 1}
+
+    async def fake_process_direct(*, on_stream=None, on_stream_end=None, **kwargs):
+        if on_stream:
+            await on_stream("partial")
+        # _last_usage already set to simulate mid-turn persistence; raise after
+        raise RuntimeError("simulated upstream LLM failure")
+
+    agent.process_direct = fake_process_direct
+
+    app = create_app(agent, model_name="test-model")
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    body = await resp.text()
+
+    # Despite the error, usage frame is present (errored turns still cost tokens)
+    assert "event: usage" in body

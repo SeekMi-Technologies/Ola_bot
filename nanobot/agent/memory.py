@@ -16,6 +16,7 @@ from loguru import logger
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think, truncate_text
 
+from nanobot.agent.admin_context import get_admin_dir_name
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.utils.gitstore import GitStore
@@ -42,20 +43,48 @@ class MemoryStore:
     def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
-        self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "history.jsonl"
-        self.legacy_history_file = self.memory_dir / "HISTORY.md"
-        self.soul_file = workspace / "SOUL.md"
-        self.user_file = workspace / "USER.md"
-        self._cursor_file = self.memory_dir / ".cursor"
-        self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
-        self._git = GitStore(workspace, tracked_files=[
-            "SOUL.md", "USER.md", "memory/MEMORY.md",
-        ])
+        # GitStore tracks only the global SOUL.md (per-tenant doctrine,
+        # currently single-tenant). MEMORY.md and USER.md moved per-admin
+        # in Ola N2 (2026-05-19) and are no longer git-tracked.
+        self._git = GitStore(workspace, tracked_files=["SOUL.md"])
         self._maybe_migrate_legacy_history()
+
+    # -- per-admin paths (ContextVar-driven) ---------------------------------
+
+    @property
+    def memory_dir(self) -> Path:
+        return ensure_dir(self.workspace / "admins" / get_admin_dir_name() / "memory")
+
+    @property
+    def memory_file(self) -> Path:
+        return self.memory_dir / "MEMORY.md"
+
+    @property
+    def history_file(self) -> Path:
+        return self.memory_dir / "history.jsonl"
+
+    @property
+    def legacy_history_file(self) -> Path:
+        return self.memory_dir / "HISTORY.md"
+
+    @property
+    def user_file(self) -> Path:
+        return ensure_dir(self.workspace / "admins" / get_admin_dir_name()) / "USER.md"
+
+    @property
+    def soul_file(self) -> Path:
+        # Global, per-tenant. Stays at workspace root until multi-customer.
+        return self.workspace / "SOUL.md"
+
+    @property
+    def _cursor_file(self) -> Path:
+        return self.memory_dir / ".cursor"
+
+    @property
+    def _dream_cursor_file(self) -> Path:
+        return self.memory_dir / ".dream_cursor"
 
     @property
     def git(self) -> GitStore:
@@ -711,20 +740,30 @@ class Dream:
     # -- tool registry -------------------------------------------------------
 
     def _build_tools(self) -> ToolRegistry:
-        """Build a minimal tool registry for the Dream agent."""
+        """Build a minimal tool registry for the Dream agent.
+
+        Read/Edit scoped to acting admin's subtree (Ola N2 #254 hardening) so
+        a prompt-injected history entry can't redirect Dream's LLM to read
+        another admin's MEMORY.md. WriteFile stays scoped to the global
+        skills/ dir — Dream-created skills are shared across admins by design.
+        """
+        from nanobot.agent.admin_context import get_admin_dir_name
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
 
         tools = ToolRegistry()
         workspace = self.store.workspace
-        # Allow reading builtin skills for reference during skill creation
+
+        def admin_workspace() -> Path:
+            return workspace / "admins" / get_admin_dir_name()
+
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
         tools.register(ReadFileTool(
-            workspace=workspace,
-            allowed_dir=workspace,
+            workspace=admin_workspace,
+            allowed_dir=admin_workspace,
             extra_allowed_dirs=extra_read,
         ))
-        tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
+        tools.register(EditFileTool(workspace=admin_workspace, allowed_dir=admin_workspace))
         # write_file resolves relative paths from workspace root, but can only
         # write under skills/ so the prompt can safely use skills/<name>/SKILL.md.
         skills_dir = workspace / "skills"
@@ -772,8 +811,13 @@ class Dream:
         (which can happen with an uncommitted working-tree edit — better to
         skip annotation than to tag the wrong line).
         SOUL.md and USER.md are never annotated.
+
+        Ola N2: file_path is admin-scoped (admins/<adminId>/memory/MEMORY.md).
+        GitStore currently only tracks SOUL.md, so line_ages returns []
+        and annotation is silently skipped — the path is correct for the
+        future if per-admin git tracking is reintroduced.
         """
-        file_path = "memory/MEMORY.md"
+        file_path = str(self.store.memory_file.relative_to(self.store.workspace))
         try:
             ages = self.store.git.line_ages(file_path)
         except Exception:
