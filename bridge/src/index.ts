@@ -30,16 +30,26 @@ import { join } from 'path';
 
 const AUTH_ROOT = process.env.AUTH_ROOT || join(homedir(), '.nanobot', 'wa');
 const SERVICE_SECRET = process.env.MCP_SERVICE_TOKEN?.trim();
+const SINGLE_ADMIN_ID = process.env.SINGLE_ADMIN_ID?.trim() || undefined;
 
 if (!SERVICE_SECRET) {
   console.error('MCP_SERVICE_TOKEN is required. Set the same value used by the CRM MCP server.');
   process.exit(1);
 }
 
-console.log('🐈 nanobot WhatsApp Bridge (multi-tenant)');
+if (SINGLE_ADMIN_ID && !/^[a-f0-9]{24}$/.test(SINGLE_ADMIN_ID)) {
+  console.error(`SINGLE_ADMIN_ID must be 24-char ObjectId hex, got: ${SINGLE_ADMIN_ID}`);
+  process.exit(1);
+}
+
+if (SINGLE_ADMIN_ID) {
+  console.log(`🐈 nanobot WhatsApp Bridge (single-admin mode: ${SINGLE_ADMIN_ID})`);
+} else {
+  console.log('🐈 nanobot WhatsApp Bridge (multi-tenant)');
+}
 console.log('=========================================\n');
 
-const server = new BridgeServer(AUTH_ROOT, SERVICE_SECRET);
+const server = new BridgeServer(AUTH_ROOT, SERVICE_SECRET, SINGLE_ADMIN_ID);
 
 process.on('SIGINT', async () => {
   console.log('\n\nShutting down...');

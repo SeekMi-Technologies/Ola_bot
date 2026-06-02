@@ -18,9 +18,10 @@
  */
 
 import { createServer as createHttpServer, IncomingMessage, ServerResponse, Server as HttpServer } from 'http';
+import { mkdirSync, writeFileSync } from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createHmac } from 'crypto';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import type { Socket } from 'net';
 import { WhatsAppClient, InboundMessage } from './whatsapp.js';
 import { writePortFile } from './portDiscovery.js';
@@ -63,11 +64,29 @@ export class BridgeServer {
   private http: HttpServer | null = null;
   private wss: WebSocketServer | null = null;
 
-  constructor(private authRoot: string, private serviceSecret: string) {}
+  /**
+   * @param singleAdminId when set, this bridge only serves that adminId — rejects
+   *   ws upgrades for any other adminId, and writes portfile to a per-admin path
+   *   (`<authRoot>/<adminId>/port`) so nanobot can route each admin to its own
+   *   bridge process. Use this for "one terminal = one admin" multi-bridge mode.
+   *   When undefined, runs in shared multi-tenant mode (one bridge serves N admins,
+   *   portfile at `<authRoot>/bridge.port`).
+   */
+  constructor(
+    private authRoot: string,
+    private serviceSecret: string,
+    private singleAdminId?: string,
+  ) {}
 
   /** Per-admin token: HMAC-SHA256(MCP_SERVICE_TOKEN, adminId). */
   private tokenFor(adminId: string): string {
     return createHmac('sha256', this.serviceSecret).update(adminId).digest('hex');
+  }
+
+  private portFilePath(): string {
+    return this.singleAdminId
+      ? join(this.authRoot, this.singleAdminId, 'port')
+      : join(this.authRoot, 'bridge.port');
   }
 
   async start(): Promise<void> {
@@ -87,10 +106,15 @@ export class BridgeServer {
         const addr = this.http!.address();
         if (addr && typeof addr === 'object') {
           const port = addr.port;
-          writePortFile(this.authRoot, port);
+          const portFile = this.portFilePath();
+          mkdirSync(dirname(portFile), { recursive: true });
+          writeFileSync(portFile, String(port), { encoding: 'utf-8' });
           console.log(`🌉 Bridge listening on ws://127.0.0.1:${port}`);
           console.log(`📂 authRoot=${this.authRoot}`);
-          console.log(`📄 portfile=${this.authRoot}/bridge.port`);
+          console.log(`📄 portfile=${portFile}`);
+          if (this.singleAdminId) {
+            console.log(`🔒 Restricted to adminId=${this.singleAdminId}`);
+          }
           resolve();
         } else {
           reject(new Error('Failed to determine bound port'));
@@ -109,6 +133,12 @@ export class BridgeServer {
     }
     const p = parsePath(req.url);
     if (!p || p.isRest || !p.queryToken) {
+      socket.destroy();
+      return;
+    }
+    // Single-admin mode: reject any other adminId
+    if (this.singleAdminId && p.adminId !== this.singleAdminId) {
+      console.warn(`Rejected WS upgrade for ${p.adminId}: bridge restricted to ${this.singleAdminId}`);
       socket.destroy();
       return;
     }

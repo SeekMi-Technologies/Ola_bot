@@ -1,6 +1,18 @@
-"""WhatsApp channel implementation using Node.js bridge."""
+"""WhatsApp channel implementation using Node.js bridge.
+
+Multi-tenant mode: ChannelManager file-system-scans ~/.nanobot/wa/<adminId>/auth/
+and constructs one WhatsAppChannel per discovered admin, each bound to the
+admin_id at construction. Inbound metadata carries `_acting_as=<adminId>` so
+the agent loop and MCP client pool isolate per tenant (replicates AskOla §2
+5-layer chain in doc/multitenancy_current_state.md).
+
+Per-admin token = HMAC-SHA256(MCP_SERVICE_TOKEN, adminId) — derived identically
+by bridge (Node) and this channel (Python) with no shared state.
+"""
 
 import asyncio
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -24,10 +36,11 @@ class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
-    bridge_url: str = "ws://localhost:3001"
-    bridge_token: str = ""
+    bridge_url: str = "ws://localhost:3001"  # multi-tenant 模式下由 ChannelManager 派生覆盖
+    bridge_token: str = ""  # legacy single-tenant; multi-tenant 用 HMAC 派生
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
+    admin_id: str = ""  # CRM Admin._id (24-hex). 非空 → multi-tenant 模式 (注 _acting_as + 用 HMAC token)
 
 
 def _bridge_token_path() -> Path:
@@ -75,13 +88,37 @@ class WhatsAppChannel(BaseChannel):
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
+        # In-memory LID→PN cache: per-WhatsAppChannel instance (天然 per-admin
+        # 隔离 in multi-tenant mode). Cross-restart 持久化 → handoff H8.
         self._lid_to_phone: dict[str, str] = {}
         self._bridge_token: str | None = None
+        self._admin_id: str = config.admin_id  # 实例级绑定 (空 = legacy single-tenant)
 
     def _effective_bridge_token(self) -> str:
-        """Resolve the bridge token, generating a local secret when needed."""
+        """Resolve the bridge token.
+
+        Multi-tenant (admin_id set): derive HMAC-SHA256(MCP_SERVICE_TOKEN, adminId).
+        Same algorithm as bridge/src/server.ts tokenFor() — both sides compute
+        identical bytes without any shared table.
+
+        Legacy single-tenant: load/create local bridge-token file (old behavior).
+        """
         if self._bridge_token is not None:
             return self._bridge_token
+
+        if self._admin_id:
+            secret = os.environ.get("MCP_SERVICE_TOKEN", "").strip()
+            if not secret:
+                raise RuntimeError(
+                    "MCP_SERVICE_TOKEN env required for multi-tenant WhatsApp channel"
+                )
+            self._bridge_token = hmac.new(
+                secret.encode("utf-8"),
+                self._admin_id.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            return self._bridge_token
+
         configured = self.config.bridge_token.strip()
         if configured:
             self._bridge_token = configured
@@ -117,42 +154,85 @@ class WhatsAppChannel(BaseChannel):
 
         return True
 
+    def _resolve_ws_url(self) -> str:
+        """Build the WebSocket URL for the next connect attempt.
+
+        Multi-tenant mode: re-read the portfile every iteration so the existing
+        reconnect loop picks up bridge restarts (port changes) without needing the
+        registry to recreate the channel. Two portfile locations checked in order:
+
+          1. Per-admin: ~/.nanobot/wa/<adminId>/port  (multi-bridge mode — each
+             admin has a dedicated bridge process started with SINGLE_ADMIN_ID env)
+          2. Shared:   ~/.nanobot/wa/bridge.port      (single shared bridge serving
+             N admins via URL routing)
+
+        Falls back to config.bridge_url if neither portfile is usable.
+
+        Legacy single-tenant mode (admin_id empty): return static config.bridge_url.
+        """
+        if not self._admin_id:
+            return self.config.bridge_url
+
+        base_url = self.config.bridge_url
+        wa_root = Path.home() / ".nanobot" / "wa"
+        for portfile in (wa_root / self._admin_id / "port", wa_root / "bridge.port"):
+            if portfile.exists():
+                try:
+                    port = int(portfile.read_text().strip())
+                    if port > 0:
+                        base_url = f"ws://127.0.0.1:{port}"
+                        break
+                except (ValueError, OSError):
+                    continue
+
+        token = self._effective_bridge_token()
+        return f"{base_url}/wa/{self._admin_id}?token={token}"
+
     async def start(self) -> None:
-        """Start the WhatsApp channel by connecting to the bridge."""
+        """Start the WhatsApp channel by connecting to the bridge.
+
+        Multi-tenant mode (admin_id set): connect to ws://<host>:<port>/wa/<adminId>?token=<hmac>;
+          token verified by bridge during WS upgrade, so no auth message needed.
+          ws_url re-derived per iteration → survives bridge restarts.
+        Legacy single-tenant mode (admin_id empty): connect to bare base URL,
+          send {type:auth,token:...} as first message (old behavior).
+        """
         import websockets
 
-        bridge_url = self.config.bridge_url
-
-        logger.info("Connecting to WhatsApp bridge at {}...", bridge_url)
-
+        log_tag = f"[{self._admin_id}]" if self._admin_id else ""
         self._running = True
 
         while self._running:
+            ws_url = self._resolve_ws_url()  # fresh per iteration
+            logger.info("{} Connecting to WhatsApp bridge at {}...", log_tag, ws_url)
+
             try:
-                async with websockets.connect(bridge_url) as ws:
+                async with websockets.connect(ws_url) as ws:
                     self._ws = ws
-                    await ws.send(
-                        json.dumps({"type": "auth", "token": self._effective_bridge_token()})
-                    )
+                    if not self._admin_id:
+                        # Legacy: auth via first message (multi-tenant uses URL ?token=)
+                        await ws.send(
+                            json.dumps({"type": "auth", "token": self._effective_bridge_token()})
+                        )
                     self._connected = True
-                    logger.info("Connected to WhatsApp bridge")
+                    logger.info("{} Connected to WhatsApp bridge", log_tag)
 
                     # Listen for messages
                     async for message in ws:
                         try:
                             await self._handle_bridge_message(message)
                         except Exception as e:
-                            logger.error("Error handling bridge message: {}", e)
+                            logger.error("{} Error handling bridge message: {}", log_tag, e)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self._connected = False
                 self._ws = None
-                logger.warning("WhatsApp bridge connection error: {}", e)
+                logger.warning("{} WhatsApp bridge connection error: {}", log_tag, e)
 
                 if self._running:
-                    logger.info("Reconnecting in 5 seconds...")
+                    logger.info("{} Reconnecting in 5 seconds...", log_tag)
                     await asyncio.sleep(5)
 
     async def stop(self) -> None:
@@ -223,11 +303,12 @@ class WhatsAppChannel(BaseChannel):
 
             # Extract just the phone number or lid as chat_id
             is_group = data.get("isGroup", False)
-            was_mentioned = data.get("wasMentioned", False)
 
-            if is_group and getattr(self.config, "group_policy", "open") == "mention":
-                if not was_mentioned:
-                    return
+            # P0: 完全不接群消息 (Baileys group bugs: #1505/#1935/#2233);
+            # group_policy 'mention' / 白名单策略 → handoff (re-enable by expanding
+            # the Literal enum and restoring the mention-based logic).
+            if is_group:
+                return
 
             # Classify by JID suffix: @s.whatsapp.net = phone, @lid.whatsapp.net = LID
             # The bridge's pn/sender fields don't consistently map to phone/LID across versions.
@@ -246,11 +327,15 @@ class WhatsAppChannel(BaseChannel):
                 elif extracted and not phone_id:
                     phone_id = extracted  # best guess for bare values
 
+            # In-memory LID→PN cache (per-instance, dies on restart). Persistence
+            # 跨重启 → handoff H8 (Baileys #2263 lid-mapping.update 仍不可靠时,
+            # 用 messages.upsert dual-ID 双向绑 + write to state.json/Mongo).
             if phone_id and lid_id:
                 self._lid_to_phone[lid_id] = phone_id
             sender_id = phone_id or self._lid_to_phone.get(lid_id, "") or lid_id or id_a or id_b
 
-            logger.info("Sender phone={} lid={} → sender_id={}", phone_id or "(empty)", lid_id or "(empty)", sender_id)
+            _tag = f"[{self._admin_id}]" if self._admin_id else ""
+            logger.info("{} Sender phone={} lid={} → sender_id={}", _tag, phone_id or "(empty)", lid_id or "(empty)", sender_id)
 
             # Extract media paths (images/documents/videos downloaded by the bridge)
             media_paths = data.get("media") or []
@@ -276,16 +361,25 @@ class WhatsAppChannel(BaseChannel):
                     media_tag = f"[{media_type}: {p}]"
                     content = f"{content}\n{media_tag}" if content else media_tag
 
+            metadata: dict[str, Any] = {
+                "message_id": message_id,
+                "timestamp": data.get("timestamp"),
+                "is_group": False,  # group already dropped above
+            }
+            if self._admin_id:
+                # ★ Multi-tenant isolation key — agent loop reads this from metadata,
+                # sets the ContextVar, and the MCP client pool injects X-Acting-As
+                # on outgoing tool calls. Mirrors email.py:191 pattern. The same
+                # adminId is enforced upstream by bridge URL routing, so this can
+                # be trusted as the source of truth for the channel's tenant scope.
+                metadata["_acting_as"] = self._admin_id
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=sender,  # Use full LID for replies
                 content=content,
                 media=media_paths,
-                metadata={
-                    "message_id": message_id,
-                    "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False),
-                },
+                metadata=metadata,
             )
 
         elif msg_type == "status":

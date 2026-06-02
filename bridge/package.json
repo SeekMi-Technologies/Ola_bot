@@ -11,10 +11,10 @@
     "test": "tsc && node --test dist/__tests__/*.test.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc.9",
-    "ws": "^8.17.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "pino": "^9.0.0",
     "qrcode-terminal": "^0.12.0",
-    "pino": "^9.0.0"
+    "ws": "^8.17.1"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

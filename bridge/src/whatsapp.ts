@@ -106,6 +106,8 @@ export class WhatsAppClient {
       // routing and LID mapping. Allow everything except FULL(=2).
       // Refs: OpenClaw#14069, hermes-agent#11951. Remove when bumping past 7.0.0-rc.9.
       shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2,
+      // P0 keepAlive at 30s; full exponential backoff + zombie detector → handoff H9
+      keepAliveIntervalMs: 30_000,
       markOnlineOnConnect: false,
     });
 

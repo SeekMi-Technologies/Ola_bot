@@ -53,8 +53,17 @@ class ChannelManager:
         self._session_manager = session_manager
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._wa_poll_task: asyncio.Task | None = None
+        self._wa_registry = None  # set below if WhatsApp channel is enabled
 
         self._init_channels()
+
+        # WhatsApp multi-tenant: replace single 'whatsapp' channel with N
+        # 'whatsapp:<adminId>' instances (one per ~/.nanobot/wa/<adminId>/auth/).
+        # Inert if WhatsApp wasn't enabled in config — base_config will be None.
+        from nanobot.channels.whatsapp_registry import WhatsAppMultiTenantRegistry
+        self._wa_registry = WhatsAppMultiTenantRegistry(self)
+        self._wa_registry.expand()
 
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
@@ -153,6 +162,12 @@ class ChannelManager:
             logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
+        # WhatsApp multi-tenant: 30s poll for new/removed admin dirs
+        if self._wa_registry is not None and self._wa_registry.base_config is not None:
+            from nanobot.channels.whatsapp_registry import wa_poll_loop
+            self._wa_poll_task = asyncio.create_task(wa_poll_loop(self._wa_registry))
+            logger.info("WhatsApp poll loop started (30s interval)")
+
         self._notify_restart_done_if_needed()
 
         # Wait for all to complete (they should run forever)
@@ -184,6 +199,14 @@ class ChannelManager:
             self._dispatch_task.cancel()
             try:
                 await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop WhatsApp poll loop
+        if self._wa_poll_task:
+            self._wa_poll_task.cancel()
+            try:
+                await self._wa_poll_task
             except asyncio.CancelledError:
                 pass
 
@@ -230,10 +253,21 @@ class ChannelManager:
                     pending.extend(extra_pending)
 
                 channel = self.channels.get(msg.channel)
+                if channel is None and msg.channel == "whatsapp":
+                    # Multi-tenant fallback: agent emits msg.channel='whatsapp' (channel name
+                    # class attr), but we registered the instance under 'whatsapp:<adminId>'.
+                    # Resolve via _acting_as so each tenant's outbound reaches its own client.
+                    acting = (msg.metadata or {}).get("_acting_as")
+                    if acting:
+                        channel = self.channels.get(f"whatsapp:{acting}")
                 if channel:
                     await self._send_with_retry(channel, msg)
                 else:
-                    logger.warning("Unknown channel: {}", msg.channel)
+                    logger.warning(
+                        "Unknown channel: {} (acting_as={})",
+                        msg.channel,
+                        (msg.metadata or {}).get("_acting_as"),
+                    )
 
             except asyncio.TimeoutError:
                 continue
