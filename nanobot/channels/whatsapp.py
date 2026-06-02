@@ -141,8 +141,22 @@ class WhatsAppChannel(BaseChannel):
             return False
 
         env = {**os.environ}
-        env["BRIDGE_TOKEN"] = self._effective_bridge_token()
-        env["AUTH_DIR"] = str(_bridge_token_path().parent)
+        # Bridge now reads MCP_SERVICE_TOKEN + AUTH_ROOT (multi-tenant mode);
+        # the old BRIDGE_TOKEN/AUTH_DIR pair was removed in the multi-tenant
+        # rewrite. login() spawns the bridge as a child for one-off QR pairing,
+        # so it just needs the canonical env propagated.
+        if "MCP_SERVICE_TOKEN" not in env or not env["MCP_SERVICE_TOKEN"].strip():
+            logger.error(
+                "MCP_SERVICE_TOKEN required for WhatsApp bridge login; "
+                "ensure it is set in the calling shell (start-dev.sh + .secrets/SERVERS.env)."
+            )
+            return False
+        env["AUTH_ROOT"] = str(Path.home() / ".nanobot" / "wa")
+        if self._admin_id:
+            # Run the spawned bridge restricted to this admin (parity with how
+            # start-dev launches it in single-shared-bridge mode without
+            # SINGLE_ADMIN_ID; login is typically per-admin so restrict here).
+            env["SINGLE_ADMIN_ID"] = self._admin_id
 
         logger.info("Starting WhatsApp bridge for QR login...")
         try:

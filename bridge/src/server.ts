@@ -20,11 +20,10 @@
 import { createServer as createHttpServer, IncomingMessage, ServerResponse, Server as HttpServer } from 'http';
 import { mkdirSync, writeFileSync } from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createHmac } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { join, dirname } from 'path';
 import type { Socket } from 'net';
 import { WhatsAppClient, InboundMessage } from './whatsapp.js';
-import { writePortFile } from './portDiscovery.js';
 
 interface SendCommand { type: 'send'; to: string; text: string; }
 interface SendMediaCommand {
@@ -81,6 +80,12 @@ export class BridgeServer {
   /** Per-admin token: HMAC-SHA256(MCP_SERVICE_TOKEN, adminId). */
   private tokenFor(adminId: string): string {
     return createHmac('sha256', this.serviceSecret).update(adminId).digest('hex');
+  }
+
+  /** Constant-time HMAC token compare. Both args are 64-char lowercase hex. */
+  private tokensMatch(expected: string, actual: string): boolean {
+    if (expected.length !== actual.length) return false;
+    return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
   }
 
   private portFilePath(): string {
@@ -142,7 +147,7 @@ export class BridgeServer {
       socket.destroy();
       return;
     }
-    if (this.tokenFor(p.adminId) !== p.queryToken) {
+    if (!this.tokensMatch(this.tokenFor(p.adminId), p.queryToken)) {
       console.warn(`Rejected WS upgrade for ${p.adminId}: bad token`);
       socket.destroy();
       return;
@@ -242,7 +247,7 @@ export class BridgeServer {
     }
     const auth = req.headers.authorization;
     const m = auth?.match(/^Bearer ([a-f0-9]{64})$/);
-    if (!m || this.tokenFor(p.adminId) !== m[1]) {
+    if (!m || !this.tokensMatch(this.tokenFor(p.adminId), m[1])) {
       res.writeHead(401).end();
       return;
     }

@@ -452,13 +452,14 @@ def test_configured_bridge_token_skips_local_token_file(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_login_exports_effective_bridge_token(monkeypatch, tmp_path):
-    token_path = tmp_path / "whatsapp-auth" / "bridge-token"
+async def test_login_exports_canonical_env_vars(monkeypatch, tmp_path):
+    """login() spawns the multi-tenant bridge — must export MCP_SERVICE_TOKEN
+    + AUTH_ROOT (the new env contract), not the legacy BRIDGE_TOKEN/AUTH_DIR."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    monkeypatch.setenv("MCP_SERVICE_TOKEN", "TEST_SECRET_123")
     calls = []
 
-    monkeypatch.setattr("nanobot.channels.whatsapp._bridge_token_path", lambda: token_path)
     monkeypatch.setattr("nanobot.channels.whatsapp._ensure_bridge_setup", lambda: bridge_dir)
     monkeypatch.setattr("nanobot.channels.whatsapp.shutil.which", lambda _: "/usr/bin/npm")
 
@@ -467,15 +468,35 @@ async def test_login_exports_effective_bridge_token(monkeypatch, tmp_path):
         return MagicMock()
 
     monkeypatch.setattr("nanobot.channels.whatsapp.subprocess.run", fake_run)
-    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    admin_id = "507f1f77bcf86cd799439011"
+    ch = WhatsAppChannel({"enabled": True, "adminId": admin_id}, MagicMock())
 
     assert await ch.login() is True
     assert len(calls) == 1
 
     _, kwargs = calls[0]
     assert kwargs["cwd"] == bridge_dir
-    assert kwargs["env"]["AUTH_DIR"] == str(token_path.parent)
-    assert kwargs["env"]["BRIDGE_TOKEN"] == token_path.read_text(encoding="utf-8")
+    assert kwargs["env"]["MCP_SERVICE_TOKEN"] == "TEST_SECRET_123"
+    assert "AUTH_ROOT" in kwargs["env"]
+    assert ".nanobot/wa" in kwargs["env"]["AUTH_ROOT"]
+    # When admin_id set, login also restricts the spawned bridge to that admin
+    assert kwargs["env"]["SINGLE_ADMIN_ID"] == admin_id
+    # Legacy env vars (replaced) should NOT be set
+    assert "BRIDGE_TOKEN" not in kwargs["env"] or kwargs["env"].get("BRIDGE_TOKEN") == ""
+    assert "AUTH_DIR" not in kwargs["env"] or "wa" in kwargs["env"].get("AUTH_DIR", "")
+
+
+@pytest.mark.asyncio
+async def test_login_fails_when_mcp_service_token_missing(monkeypatch, tmp_path):
+    """login() must hard-fail (return False) when MCP_SERVICE_TOKEN is unset —
+    spawning the bridge without it produces an instant exit-1 + confusing error."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.delenv("MCP_SERVICE_TOKEN", raising=False)
+    monkeypatch.setattr("nanobot.channels.whatsapp._ensure_bridge_setup", lambda: bridge_dir)
+
+    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    assert await ch.login() is False
 
 
 @pytest.mark.asyncio
