@@ -63,6 +63,11 @@ test('parseWaPath: undefined / garbage → null', () => {
   assert.equal(parseWaPath(''), null);
 });
 
+test('parseWaPath: rejects unknown action segment', () => {
+  assert.equal(parseWaPath(`/wa/${ID}/hacked`), null);
+  assert.equal(parseWaPath(`/wa/${ID}/logout`), null); // DELETE is bare /wa/<id>, not an action
+});
+
 // ---- BridgeServer REST ----------------------------------------------------
 
 const SECRET = 'test-service-secret-0123456789ab';
@@ -77,13 +82,14 @@ function withServer(
   return async () => {
     const authRoot = mkdtempSync(join(tmpdir(), 'bridge-srv-'));
     const server = new BridgeServer(authRoot, SECRET);
-    await server.start();
-    const port = Number(readFileSync(join(authRoot, 'bridge.port'), 'utf-8').trim());
     const tokenFor = (id: string) => createHmac('sha256', SECRET).update(id).digest('hex');
     try {
+      // start() inside try so a bind failure still hits the finally (no tempdir leak).
+      await server.start();
+      const port = Number(readFileSync(join(authRoot, 'bridge.port'), 'utf-8').trim());
       await fn({ base: `http://127.0.0.1:${port}`, tokenFor, authRoot });
     } finally {
-      await server.stop();
+      await server.stop().catch((e) => console.warn('test server stop failed:', (e as Error)?.message));
       rmSync(authRoot, { recursive: true, force: true });
     }
   };

@@ -48,13 +48,17 @@ const ADMIN_ID_RE = /^[a-f0-9]{24}$/;
 
 export interface WaPath {
   adminId: string;
-  action: string | null;   // null = bare /wa/<id> (WS upgrade or DELETE); else 'login'|'status'
+  action: 'login' | 'status' | null; // null = bare /wa/<id> (WS upgrade or DELETE)
   queryToken: string | null;
 }
+
+const VALID_ACTIONS = new Set(['login', 'status']);
 
 /**
  * Parse /wa/<adminId>[/<action>][?token=...] via the URL API.
  * Method-based dispatch lives in the caller — this only extracts the shape.
+ * Unknown action segments are rejected (return null → 404) so we don't leak
+ * that the path structure was valid.
  */
 export function parseWaPath(rawUrl: string | undefined): WaPath | null {
   if (!rawUrl) return null;
@@ -67,7 +71,10 @@ export function parseWaPath(rawUrl: string | undefined): WaPath | null {
   const segs = u.pathname.split('/').filter(Boolean);
   if (segs.length < 2 || segs.length > 3 || segs[0] !== 'wa') return null;
   if (!ADMIN_ID_RE.test(segs[1])) return null;
-  return { adminId: segs[1], action: segs[2] ?? null, queryToken: u.searchParams.get('token') };
+  const seg = segs[2];
+  if (seg !== undefined && !VALID_ACTIONS.has(seg)) return null;
+  const action = (seg ?? null) as 'login' | 'status' | null;
+  return { adminId: segs[1], action, queryToken: u.searchParams.get('token') };
 }
 
 // Per-admin live snapshot, served over REST. The bridge is the source of truth;
@@ -243,6 +250,9 @@ export class BridgeServer {
       },
     });
     this.clients.set(adminId, c);
+    // Set the initial snapshot synchronously so restLogin reflects a real
+    // qr_pending immediately — onQR fires async, after connect() returns.
+    this.setState(adminId, { status: 'qr_pending' });
 
     // Per-client error isolation: a single admin's failure must not cascade.
     c.connect().catch((err) => {
@@ -278,7 +288,10 @@ export class BridgeServer {
 
   private setState(adminId: string, patch: Partial<WaSnapshot>): void {
     const prev = this.state.get(adminId) ?? { status: 'disconnected' };
-    this.state.set(adminId, { ...prev, ...patch });
+    const next: WaSnapshot = { ...prev, ...patch };
+    // A patched `qr: undefined` should remove the key, not store an explicit undefined.
+    if ('qr' in patch && patch.qr === undefined) delete next.qr;
+    this.state.set(adminId, next);
   }
 
   private handleRest(req: IncomingMessage, res: ServerResponse): void {

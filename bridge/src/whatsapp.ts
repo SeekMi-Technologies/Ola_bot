@@ -85,6 +85,7 @@ export class WhatsAppClient {
   }
 
   async connect(): Promise<void> {
+    this.closing = false; // reset, in case connect() runs on a recycled instance after disconnect()
     const logger = pino({ level: 'silent' });
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     const { version } = await fetchLatestBaileysVersion();
