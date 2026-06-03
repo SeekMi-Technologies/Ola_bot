@@ -34,7 +34,10 @@ export interface InboundMessage {
 }
 
 export interface WhatsAppClientOptions {
-  authDir: string;
+  /** CRM Admin._id (24-char ObjectId hex). Used for log prefixes. */
+  adminId: string;
+  /** Per-admin root dir. authDir = <dataDir>/auth, mediaDir = <dataDir>/media. */
+  dataDir: string;
   onMessage: (msg: InboundMessage) => void;
   onQR: (qr: string) => void;
   onStatus: (status: string) => void;
@@ -44,9 +47,15 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private readonly authDir: string;
+  private readonly mediaDir: string;
+  private readonly logTag: string;
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
+    this.authDir = join(options.dataDir, 'auth');
+    this.mediaDir = join(options.dataDir, 'media');
+    this.logTag = `[${options.adminId}]`;
   }
 
   private normalizeJid(jid: string | undefined | null): string {
@@ -76,10 +85,10 @@ export class WhatsAppClient {
 
   async connect(): Promise<void> {
     const logger = pino({ level: 'silent' });
-    const { state, saveCreds } = await useMultiFileAuthState(this.options.authDir);
+    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`Using Baileys version: ${version.join('.')}`);
+    console.log(`${this.logTag} Using Baileys version: ${version.join('.')}`);
 
     // Create socket following OpenClaw's pattern
     this.sock = makeWASocket({
@@ -92,6 +101,13 @@ export class WhatsAppClient {
       printQRInTerminal: false,
       browser: ['nanobot', 'cli', VERSION],
       syncFullHistory: false,
+      // Baileys v7 fix: without this callback, syncFullHistory:false silently rejects
+      // ALL sync types (incl. INITIAL_BOOTSTRAP/RECENT/ON_DEMAND), killing message
+      // routing and LID mapping. Allow everything except FULL(=2).
+      // Refs: OpenClaw#14069, hermes-agent#11951. Remove when bumping past 7.0.0-rc.9.
+      shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2,
+      // P0 keepAlive at 30s; full exponential backoff + zombie detector → handoff H9
+      keepAliveIntervalMs: 30_000,
       markOnlineOnConnect: false,
     });
 
@@ -107,8 +123,7 @@ export class WhatsAppClient {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // Display QR code in terminal
-        console.log('\n📱 Scan this QR code with WhatsApp (Linked Devices):\n');
+        console.log(`\n${this.logTag} 📱 Scan this QR code with WhatsApp (Linked Devices):\n`);
         qrcode.generate(qr, { small: true });
         this.options.onQR(qr);
       }
@@ -117,19 +132,19 @@ export class WhatsAppClient {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        console.log(`Connection closed. Status: ${statusCode}, Will reconnect: ${shouldReconnect}`);
+        console.log(`${this.logTag} Connection closed. Status: ${statusCode}, Will reconnect: ${shouldReconnect}`);
         this.options.onStatus('disconnected');
 
         if (shouldReconnect && !this.reconnecting) {
           this.reconnecting = true;
-          console.log('Reconnecting in 5 seconds...');
+          console.log(`${this.logTag} Reconnecting in 5 seconds...`);
           setTimeout(() => {
             this.reconnecting = false;
             this.connect();
           }, 5000);
         }
       } else if (connection === 'open') {
-        console.log('✅ Connected to WhatsApp');
+        console.log(`${this.logTag} ✅ Connected to WhatsApp`);
         this.options.onStatus('connected');
       }
     });
@@ -189,8 +204,7 @@ export class WhatsAppClient {
 
   private async downloadMedia(msg: any, mimetype?: string, fileName?: string): Promise<string | null> {
     try {
-      const mediaDir = join(this.options.authDir, '..', 'media');
-      await mkdir(mediaDir, { recursive: true });
+      await mkdir(this.mediaDir, { recursive: true });
 
       const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;
 
@@ -206,12 +220,12 @@ export class WhatsAppClient {
         outFilename = `wa_${Date.now()}_${randomBytes(4).toString('hex')}${ext}`;
       }
 
-      const filepath = join(mediaDir, outFilename);
+      const filepath = join(this.mediaDir, outFilename);
       await writeFile(filepath, buffer);
 
       return filepath;
     } catch (err) {
-      console.error('Failed to download media:', err);
+      console.error(`${this.logTag} Failed to download media:`, err);
       return null;
     }
   }
