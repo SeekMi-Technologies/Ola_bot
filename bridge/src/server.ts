@@ -228,9 +228,18 @@ export class BridgeServer {
         this.broadcastTo(adminId, { type: 'qr', qr });
       },
       onStatus: (status: string) => {
-        // Clear the QR once connected; it is stale and shouldn't be served.
-        this.setState(adminId, status === 'connected' ? { status, qr: undefined } : { status });
         this.broadcastTo(adminId, { type: 'status', status });
+        if (status === 'logged_out') {
+          // Terminal (401): session is dead. Drop the client + creds so the next
+          // login starts fresh and emits a new QR (instead of reusing a dead client).
+          this.cleanupAdmin(adminId);
+          this.setState(adminId, { status: 'logged_out' });
+        } else if (status === 'connected') {
+          // Clear the QR once connected; it is stale and shouldn't be served.
+          this.setState(adminId, { status, qr: undefined });
+        } else {
+          this.setState(adminId, { status });
+        }
       },
     });
     this.clients.set(adminId, c);
@@ -314,6 +323,18 @@ export class BridgeServer {
     res.end(JSON.stringify(body));
   }
 
+  /** Drop everything for an admin: WS subscribers, the Baileys client, on-disk auth. */
+  private cleanupAdmin(adminId: string): void {
+    const subs = this.sockets.get(adminId);
+    if (subs) {
+      for (const ws of subs) ws.close();
+      this.sockets.delete(adminId);
+    }
+    this.clients.delete(adminId);
+    // Remove on-disk auth so nanobot's fs-scan drops the channel and next login re-scans.
+    rmSync(join(this.authRoot, adminId), { recursive: true, force: true });
+  }
+
   /** DELETE /wa/<id> — disconnect, drop subscribers, wipe authDir so fs-scan unloads it. */
   private async restLogout(adminId: string, res: ServerResponse): Promise<void> {
     const client = this.clients.get(adminId);
@@ -323,15 +344,8 @@ export class BridgeServer {
       } catch (err) {
         console.error(`[${adminId}] disconnect during logout failed:`, err);
       }
-      this.clients.delete(adminId);
     }
-    const subs = this.sockets.get(adminId);
-    if (subs) {
-      for (const ws of subs) ws.close();
-      this.sockets.delete(adminId);
-    }
-    // Remove on-disk auth so nanobot's fs-scan drops the channel and next login re-scans.
-    rmSync(join(this.authRoot, adminId), { recursive: true, force: true });
+    this.cleanupAdmin(adminId);
     this.state.set(adminId, { status: 'logged_out' });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'logged_out' }));
