@@ -1,17 +1,31 @@
 /**
- * WebSocket server for Python-Node.js bridge communication.
- * Security: binds to 127.0.0.1 only; requires BRIDGE_TOKEN auth; rejects browser Origin headers.
+ * WebSocket + HTTP server for the multi-tenant Python ↔ Node bridge.
+ *
+ * Security:
+ * - Binds to 127.0.0.1 only.
+ * - Rejects browser-originated WebSocket connections (Origin header present).
+ * - Per-admin token = HMAC-SHA256(MCP_SERVICE_TOKEN, adminId) — same secret on
+ *   bridge/nanobot/CRM, so all three derive identical tokens with no shared table.
+ *
+ * Routing:
+ * - WS:   /wa/<adminId>?token=<hmac>   — per-admin bidirectional stream
+ * - REST: GET /wa/<adminId>/status     — dev debug, Authorization: Bearer <hmac>
+ *
+ * Lifecycle:
+ * - WhatsAppClient is lazily created on first WS attach for an adminId.
+ * - Per-admin subscriber Set<WebSocket>; broadcasts go only to that adminId's set.
+ * - Per-client init wrapped in try/catch so one admin's failure can't cascade.
  */
 
+import { createServer as createHttpServer, IncomingMessage, ServerResponse, Server as HttpServer } from 'http';
+import { mkdirSync, writeFileSync } from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
+import { createHmac, timingSafeEqual } from 'crypto';
+import { join, dirname } from 'path';
+import type { Socket } from 'net';
 import { WhatsAppClient, InboundMessage } from './whatsapp.js';
 
-interface SendCommand {
-  type: 'send';
-  to: string;
-  text: string;
-}
-
+interface SendCommand { type: 'send'; to: string; text: string; }
 interface SendMediaCommand {
   type: 'send_media';
   to: string;
@@ -20,136 +34,260 @@ interface SendMediaCommand {
   caption?: string;
   fileName?: string;
 }
-
 type BridgeCommand = SendCommand | SendMediaCommand;
 
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error';
+  type: 'message' | 'status' | 'qr' | 'error' | 'sent';
   [key: string]: unknown;
 }
 
-export class BridgeServer {
-  private wss: WebSocketServer | null = null;
-  private wa: WhatsAppClient | null = null;
-  private clients: Set<WebSocket> = new Set();
+// 24-char ObjectId hex for adminId; 64-char hex for HMAC-SHA256 token
+const PATH_RE = /^\/wa\/([a-f0-9]{24})(?:\/(status))?(?:\?token=([a-f0-9]{64}))?$/;
 
-  constructor(private port: number, private authDir: string, private token: string) {}
+interface PathParts {
+  adminId: string;
+  isRest: boolean;  // true if /status suffix present (REST), false for bare /wa/<id> (WS)
+  queryToken?: string;
+}
+
+function parsePath(url: string | undefined): PathParts | null {
+  if (!url) return null;
+  const m = url.match(PATH_RE);
+  if (!m) return null;
+  return { adminId: m[1], isRest: m[2] === 'status', queryToken: m[3] };
+}
+
+export class BridgeServer {
+  private clients: Map<string, WhatsAppClient> = new Map();
+  private sockets: Map<string, Set<WebSocket>> = new Map();
+  private http: HttpServer | null = null;
+  private wss: WebSocketServer | null = null;
+
+  /**
+   * @param singleAdminId when set, this bridge only serves that adminId — rejects
+   *   ws upgrades for any other adminId, and writes portfile to a per-admin path
+   *   (`<authRoot>/<adminId>/port`) so nanobot can route each admin to its own
+   *   bridge process. Use this for "one terminal = one admin" multi-bridge mode.
+   *   When undefined, runs in shared multi-tenant mode (one bridge serves N admins,
+   *   portfile at `<authRoot>/bridge.port`).
+   */
+  constructor(
+    private authRoot: string,
+    private serviceSecret: string,
+    private singleAdminId?: string,
+  ) {}
+
+  /** Per-admin token: HMAC-SHA256(MCP_SERVICE_TOKEN, adminId). */
+  private tokenFor(adminId: string): string {
+    return createHmac('sha256', this.serviceSecret).update(adminId).digest('hex');
+  }
+
+  /** Constant-time HMAC token compare. Both args are 64-char lowercase hex. */
+  private tokensMatch(expected: string, actual: string): boolean {
+    if (expected.length !== actual.length) return false;
+    return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
+  }
+
+  private portFilePath(): string {
+    return this.singleAdminId
+      ? join(this.authRoot, this.singleAdminId, 'port')
+      : join(this.authRoot, 'bridge.port');
+  }
 
   async start(): Promise<void> {
-    if (!this.token.trim()) {
-      throw new Error('BRIDGE_TOKEN is required');
+    if (!this.serviceSecret.trim()) {
+      throw new Error('MCP_SERVICE_TOKEN is required');
     }
 
-    // Bind to localhost only — never expose to external network
-    this.wss = new WebSocketServer({
-      host: '127.0.0.1',
-      port: this.port,
-      verifyClient: (info, done) => {
-        const origin = info.origin || info.req.headers.origin;
-        if (origin) {
-          console.warn(`Rejected WebSocket connection with Origin header: ${origin}`);
-          done(false, 403, 'Browser-originated WebSocket connections are not allowed');
-          return;
-        }
-        done(true);
-      },
-    });
-    console.log(`🌉 Bridge server listening on ws://127.0.0.1:${this.port}`);
-    console.log('🔒 Token authentication enabled');
+    this.http = createHttpServer((req, res) => this.handleRest(req, res));
+    this.wss = new WebSocketServer({ noServer: true });
 
-    // Initialize WhatsApp client
-    this.wa = new WhatsAppClient({
-      authDir: this.authDir,
-      onMessage: (msg) => this.broadcast({ type: 'message', ...msg }),
-      onQR: (qr) => this.broadcast({ type: 'qr', qr }),
-      onStatus: (status) => this.broadcast({ type: 'status', status }),
-    });
+    this.http.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket as Socket, head));
 
-    // Handle WebSocket connections
-    this.wss.on('connection', (ws) => {
-      // Require auth handshake as first message
-      const timeout = setTimeout(() => ws.close(4001, 'Auth timeout'), 5000);
-      ws.once('message', (data) => {
-        clearTimeout(timeout);
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === 'auth' && msg.token === this.token) {
-            console.log('🔗 Python client authenticated');
-            this.setupClient(ws);
-          } else {
-            ws.close(4003, 'Invalid token');
+    // listen(0) → OS picks any free port; write actual port to portfile
+    await new Promise<void>((resolve, reject) => {
+      this.http!.once('error', reject);
+      this.http!.listen(0, '127.0.0.1', () => {
+        const addr = this.http!.address();
+        if (addr && typeof addr === 'object') {
+          const port = addr.port;
+          const portFile = this.portFilePath();
+          mkdirSync(dirname(portFile), { recursive: true });
+          writeFileSync(portFile, String(port), { encoding: 'utf-8' });
+          console.log(`🌉 Bridge listening on ws://127.0.0.1:${port}`);
+          console.log(`📂 authRoot=${this.authRoot}`);
+          console.log(`📄 portfile=${portFile}`);
+          if (this.singleAdminId) {
+            console.log(`🔒 Restricted to adminId=${this.singleAdminId}`);
           }
-        } catch {
-          ws.close(4003, 'Invalid auth message');
+          resolve();
+        } else {
+          reject(new Error('Failed to determine bound port'));
         }
       });
     });
-
-    // Connect to WhatsApp
-    await this.wa.connect();
   }
 
-  private setupClient(ws: WebSocket): void {
-    this.clients.add(ws);
+  private handleUpgrade(req: IncomingMessage, socket: Socket, head: Buffer): void {
+    // Reject browser-originated connections
+    const origin = req.headers.origin || (req.headers as any).Origin;
+    if (origin) {
+      console.warn(`Rejected WS upgrade with Origin: ${origin}`);
+      socket.destroy();
+      return;
+    }
+    const p = parsePath(req.url);
+    if (!p || p.isRest || !p.queryToken) {
+      socket.destroy();
+      return;
+    }
+    // Single-admin mode: reject any other adminId
+    if (this.singleAdminId && p.adminId !== this.singleAdminId) {
+      console.warn(`Rejected WS upgrade for ${p.adminId}: bridge restricted to ${this.singleAdminId}`);
+      socket.destroy();
+      return;
+    }
+    if (!this.tokensMatch(this.tokenFor(p.adminId), p.queryToken)) {
+      console.warn(`Rejected WS upgrade for ${p.adminId}: bad token`);
+      socket.destroy();
+      return;
+    }
+    this.wss!.handleUpgrade(req, socket, head, (ws) => this.attachWs(p.adminId, ws));
+  }
+
+  private attachWs(adminId: string, ws: WebSocket): void {
+    let set = this.sockets.get(adminId);
+    if (!set) {
+      set = new Set();
+      this.sockets.set(adminId, set);
+    }
+    set.add(ws);
+    console.log(`🔗 [${adminId}] Python client attached (${set.size} subscriber${set.size > 1 ? 's' : ''})`);
+
+    // Lazily create Baileys client; safe to call repeatedly
+    this.getOrCreateClient(adminId);
 
     ws.on('message', async (data) => {
       try {
         const cmd = JSON.parse(data.toString()) as BridgeCommand;
-        await this.handleCommand(cmd);
-        ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
-      } catch (error) {
-        console.error('Error handling command:', error);
-        ws.send(JSON.stringify({ type: 'error', error: String(error) }));
+        await this.handleCommand(adminId, cmd);
+        ws.send(JSON.stringify({ type: 'sent', to: (cmd as any).to } as BridgeMessage));
+      } catch (err) {
+        console.error(`[${adminId}] command error:`, err);
+        ws.send(JSON.stringify({ type: 'error', error: String(err) } as BridgeMessage));
       }
     });
 
     ws.on('close', () => {
-      console.log('🔌 Python client disconnected');
-      this.clients.delete(ws);
+      set!.delete(ws);
+      console.log(`🔌 [${adminId}] Python client detached (${set!.size} left)`);
     });
 
-    ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
-      this.clients.delete(ws);
+    ws.on('error', (err) => {
+      console.error(`[${adminId}] ws error:`, err);
+      set!.delete(ws);
     });
   }
 
-  private async handleCommand(cmd: BridgeCommand): Promise<void> {
-    if (!this.wa) return;
+  private getOrCreateClient(adminId: string): WhatsAppClient {
+    const existing = this.clients.get(adminId);
+    if (existing) return existing;
 
+    const dataDir = join(this.authRoot, adminId);
+    const c = new WhatsAppClient({
+      adminId,
+      dataDir,
+      onMessage: (msg: InboundMessage) => this.broadcastTo(adminId, { type: 'message', ...msg }),
+      onQR: (qr: string) => this.broadcastTo(adminId, { type: 'qr', qr }),
+      onStatus: (status: string) => this.broadcastTo(adminId, { type: 'status', status }),
+    });
+    this.clients.set(adminId, c);
+
+    // Per-client error isolation: a single admin's failure must not cascade.
+    c.connect().catch((err) => {
+      console.error(`[${adminId}] Baileys init failed:`, err);
+      this.broadcastTo(adminId, { type: 'status', status: 'disconnected', error: String(err) });
+    });
+    return c;
+  }
+
+  private async handleCommand(adminId: string, cmd: BridgeCommand): Promise<void> {
+    const client = this.clients.get(adminId);
+    if (!client) throw new Error(`No Baileys client for admin ${adminId}`);
     if (cmd.type === 'send') {
-      await this.wa.sendMessage(cmd.to, cmd.text);
+      await client.sendMessage(cmd.to, cmd.text);
     } else if (cmd.type === 'send_media') {
-      await this.wa.sendMedia(cmd.to, cmd.filePath, cmd.mimetype, cmd.caption, cmd.fileName);
+      await client.sendMedia(cmd.to, cmd.filePath, cmd.mimetype, cmd.caption, cmd.fileName);
+    } else {
+      throw new Error(`Unknown command type: ${(cmd as any).type}`);
     }
   }
 
-  private broadcast(msg: BridgeMessage): void {
+  private broadcastTo(adminId: string, msg: BridgeMessage): void {
+    const set = this.sockets.get(adminId);
+    if (!set || set.size === 0) return;
     const data = JSON.stringify(msg);
-    for (const client of this.clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data);
+    for (const ws of set) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(data);
       }
     }
   }
 
-  async stop(): Promise<void> {
-    // Close all client connections
-    for (const client of this.clients) {
-      client.close();
+  private handleRest(req: IncomingMessage, res: ServerResponse): void {
+    // Currently only: GET /wa/<adminId>/status
+    if (req.method !== 'GET') {
+      res.writeHead(405).end();
+      return;
     }
-    this.clients.clear();
+    const p = parsePath(req.url);
+    if (!p || !p.isRest) {
+      res.writeHead(404).end();
+      return;
+    }
+    const auth = req.headers.authorization;
+    const m = auth?.match(/^Bearer ([a-f0-9]{64})$/);
+    if (!m || !this.tokensMatch(this.tokenFor(p.adminId), m[1])) {
+      res.writeHead(401).end();
+      return;
+    }
+    const client = this.clients.get(p.adminId);
+    const subs = this.sockets.get(p.adminId)?.size ?? 0;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      adminId: p.adminId,
+      clientLoaded: !!client,
+      subscribers: subs,
+    }));
+  }
 
-    // Close WebSocket server
+  async stop(): Promise<void> {
+    // Close all WS subscribers
+    for (const [adminId, set] of this.sockets) {
+      for (const ws of set) ws.close();
+      console.log(`Closed subscribers for ${adminId}`);
+    }
+    this.sockets.clear();
+
     if (this.wss) {
       this.wss.close();
       this.wss = null;
     }
 
-    // Disconnect WhatsApp
-    if (this.wa) {
-      await this.wa.disconnect();
-      this.wa = null;
+    // Disconnect all Baileys clients
+    for (const [adminId, client] of this.clients) {
+      try {
+        await client.disconnect();
+        console.log(`Disconnected ${adminId}`);
+      } catch (err) {
+        console.error(`Error disconnecting ${adminId}:`, err);
+      }
+    }
+    this.clients.clear();
+
+    if (this.http) {
+      await new Promise<void>((resolve) => this.http!.close(() => resolve()));
+      this.http = null;
     }
   }
 }
