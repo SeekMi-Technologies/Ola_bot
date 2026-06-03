@@ -41,6 +41,11 @@ class WhatsAppConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
     admin_id: str = ""  # CRM Admin._id (24-hex). 非空 → multi-tenant 模式 (注 _acting_as + 用 HMAC token)
+    # Voice transcription — falls back to env vars if empty
+    transcription_provider: str = "groq"
+    transcription_api_key: str = ""
+    transcription_api_base: str = ""
+    transcription_language: str | None = None
 
 
 def _bridge_token_path() -> Path:
@@ -93,6 +98,16 @@ class WhatsAppChannel(BaseChannel):
         self._lid_to_phone: dict[str, str] = {}
         self._bridge_token: str | None = None
         self._admin_id: str = config.admin_id  # 实例级绑定 (空 = legacy single-tenant)
+        # Propagate transcription config from channel config → BaseChannel defaults;
+        # fall back to env vars (GROQ_API_KEY / OPENAI_API_KEY) when config is empty.
+        self.transcription_provider = config.transcription_provider or "groq"
+        self.transcription_api_key = (
+            config.transcription_api_key
+            or os.environ.get("GROQ_API_KEY", "")
+            or os.environ.get("OPENAI_API_KEY", "")
+        )
+        self.transcription_api_base = config.transcription_api_base or ""
+        self.transcription_language = config.transcription_language
 
     def _effective_bridge_token(self) -> str:
         """Resolve the bridge token.
@@ -355,12 +370,14 @@ class WhatsAppChannel(BaseChannel):
             media_paths = data.get("media") or []
 
             # Handle voice transcription if it's a voice message
+            voice_transcribed = False
             if content == "[Voice Message]":
                 if media_paths:
                     logger.info("Transcribing voice message from {}...", sender_id)
                     transcription = await self.transcribe_audio(media_paths[0])
                     if transcription:
                         content = transcription
+                        voice_transcribed = True
                         logger.info("Transcribed voice from {}: {}...", sender_id, transcription[:50])
                     else:
                         content = "[Voice Message: Transcription failed]"
@@ -368,12 +385,17 @@ class WhatsAppChannel(BaseChannel):
                     content = "[Voice Message: Audio not available]"
 
             # Build content tags matching Telegram's pattern: [image: /path] or [file: /path]
-            if media_paths:
-                for p in media_paths:
-                    mime, _ = mimetypes.guess_type(p)
-                    media_type = "image" if mime and mime.startswith("image/") else "file"
-                    media_tag = f"[{media_type}: {p}]"
-                    content = f"{content}\n{media_tag}" if content else media_tag
+            # Skip audio file tag when transcription succeeded (text already contains transcript)
+            remaining_media = []
+            for p in media_paths:
+                if voice_transcribed:
+                    # Drop the transcribed audio file from media — transcript is the content
+                    continue
+                mime, _ = mimetypes.guess_type(p)
+                media_type = "image" if mime and mime.startswith("image/") else "file"
+                media_tag = f"[{media_type}: {p}]"
+                content = f"{content}\n{media_tag}" if content else media_tag
+                remaining_media.append(p)
 
             metadata: dict[str, Any] = {
                 "message_id": message_id,
@@ -392,7 +414,7 @@ class WhatsAppChannel(BaseChannel):
                 sender_id=sender_id,
                 chat_id=sender,  # Use full LID for replies
                 content=content,
-                media=media_paths,
+                media=remaining_media if voice_transcribed else media_paths,
                 metadata=metadata,
             )
 
