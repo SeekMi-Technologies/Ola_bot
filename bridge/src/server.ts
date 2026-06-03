@@ -7,18 +7,20 @@
  * - Per-admin token = HMAC-SHA256(MCP_SERVICE_TOKEN, adminId) — same secret on
  *   bridge/nanobot/CRM, so all three derive identical tokens with no shared table.
  *
- * Routing:
- * - WS:   /wa/<adminId>?token=<hmac>   — per-admin bidirectional stream
- * - REST: GET /wa/<adminId>/status     — dev debug, Authorization: Bearer <hmac>
+ * Routing (Authorization: Bearer <hmac> for REST; token=<hmac> query for WS):
+ * - WS:     /wa/<adminId>?token=<hmac>  — per-admin bidirectional stream
+ * - POST    /wa/<adminId>/login         — CRM triggers connect; QR arrives via snapshot
+ * - GET     /wa/<adminId>/status        — { status, qr? } from snapshot
+ * - DELETE  /wa/<adminId>               — disconnect + wipe authDir (logout)
  *
  * Lifecycle:
- * - WhatsAppClient is lazily created on first WS attach for an adminId.
+ * - WhatsAppClient is lazily created on first WS attach OR POST /login for an adminId.
  * - Per-admin subscriber Set<WebSocket>; broadcasts go only to that adminId's set.
  * - Per-client init wrapped in try/catch so one admin's failure can't cascade.
  */
 
 import { createServer as createHttpServer, IncomingMessage, ServerResponse, Server as HttpServer } from 'http';
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { join, dirname } from 'path';
@@ -41,25 +43,47 @@ interface BridgeMessage {
   [key: string]: unknown;
 }
 
-// 24-char ObjectId hex for adminId; 64-char hex for HMAC-SHA256 token
-const PATH_RE = /^\/wa\/([a-f0-9]{24})(?:\/(status))?(?:\?token=([a-f0-9]{64}))?$/;
+// adminId is a 24-char ObjectId hex; this is a format guard, not a router.
+const ADMIN_ID_RE = /^[a-f0-9]{24}$/;
 
-interface PathParts {
+export interface WaPath {
   adminId: string;
-  isRest: boolean;  // true if /status suffix present (REST), false for bare /wa/<id> (WS)
-  queryToken?: string;
+  action: string | null;   // null = bare /wa/<id> (WS upgrade or DELETE); else 'login'|'status'
+  queryToken: string | null;
 }
 
-function parsePath(url: string | undefined): PathParts | null {
-  if (!url) return null;
-  const m = url.match(PATH_RE);
-  if (!m) return null;
-  return { adminId: m[1], isRest: m[2] === 'status', queryToken: m[3] };
+/**
+ * Parse /wa/<adminId>[/<action>][?token=...] via the URL API.
+ * Method-based dispatch lives in the caller — this only extracts the shape.
+ */
+export function parseWaPath(rawUrl: string | undefined): WaPath | null {
+  if (!rawUrl) return null;
+  let u: URL;
+  try {
+    u = new URL(rawUrl, 'http://127.0.0.1');
+  } catch {
+    return null;
+  }
+  const segs = u.pathname.split('/').filter(Boolean);
+  if (segs.length < 2 || segs.length > 3 || segs[0] !== 'wa') return null;
+  if (!ADMIN_ID_RE.test(segs[1])) return null;
+  return { adminId: segs[1], action: segs[2] ?? null, queryToken: u.searchParams.get('token') };
+}
+
+// Per-admin live snapshot, served over REST. The bridge is the source of truth;
+// CRM/Integration mirrors this on pull.
+//
+// No phone number: WhatsApp now exposes a privacy LID (not the real MSISDN) on
+// sock.user.id, so we don't surface an identifier we can't trust (see H8 / Baileys #2263).
+interface WaSnapshot {
+  status: string;  // disconnected | qr_pending | connected | logged_out
+  qr?: string;     // present while qr_pending
 }
 
 export class BridgeServer {
   private clients: Map<string, WhatsAppClient> = new Map();
   private sockets: Map<string, Set<WebSocket>> = new Map();
+  private state: Map<string, WaSnapshot> = new Map();
   private http: HttpServer | null = null;
   private wss: WebSocketServer | null = null;
 
@@ -136,8 +160,9 @@ export class BridgeServer {
       socket.destroy();
       return;
     }
-    const p = parsePath(req.url);
-    if (!p || p.isRest || !p.queryToken) {
+    const p = parseWaPath(req.url);
+    // WS only on bare /wa/<id> with a token; /login & /status are REST.
+    if (!p || p.action !== null || !p.queryToken) {
       socket.destroy();
       return;
     }
@@ -198,14 +223,22 @@ export class BridgeServer {
       adminId,
       dataDir,
       onMessage: (msg: InboundMessage) => this.broadcastTo(adminId, { type: 'message', ...msg }),
-      onQR: (qr: string) => this.broadcastTo(adminId, { type: 'qr', qr }),
-      onStatus: (status: string) => this.broadcastTo(adminId, { type: 'status', status }),
+      onQR: (qr: string) => {
+        this.setState(adminId, { status: 'qr_pending', qr });
+        this.broadcastTo(adminId, { type: 'qr', qr });
+      },
+      onStatus: (status: string) => {
+        // Clear the QR once connected; it is stale and shouldn't be served.
+        this.setState(adminId, status === 'connected' ? { status, qr: undefined } : { status });
+        this.broadcastTo(adminId, { type: 'status', status });
+      },
     });
     this.clients.set(adminId, c);
 
     // Per-client error isolation: a single admin's failure must not cascade.
     c.connect().catch((err) => {
       console.error(`[${adminId}] Baileys init failed:`, err);
+      this.setState(adminId, { status: 'disconnected' });
       this.broadcastTo(adminId, { type: 'status', status: 'disconnected', error: String(err) });
     });
     return c;
@@ -234,31 +267,74 @@ export class BridgeServer {
     }
   }
 
+  private setState(adminId: string, patch: Partial<WaSnapshot>): void {
+    const prev = this.state.get(adminId) ?? { status: 'disconnected' };
+    this.state.set(adminId, { ...prev, ...patch });
+  }
+
   private handleRest(req: IncomingMessage, res: ServerResponse): void {
-    // Currently only: GET /wa/<adminId>/status
-    if (req.method !== 'GET') {
-      res.writeHead(405).end();
-      return;
-    }
-    const p = parsePath(req.url);
-    if (!p || !p.isRest) {
+    const p = parseWaPath(req.url);
+    if (!p) {
       res.writeHead(404).end();
       return;
     }
-    const auth = req.headers.authorization;
-    const m = auth?.match(/^Bearer ([a-f0-9]{64})$/);
+    if (this.singleAdminId && p.adminId !== this.singleAdminId) {
+      res.writeHead(404).end();
+      return;
+    }
+    const m = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/);
     if (!m || !this.tokensMatch(this.tokenFor(p.adminId), m[1])) {
       res.writeHead(401).end();
       return;
     }
-    const client = this.clients.get(p.adminId);
-    const subs = this.sockets.get(p.adminId)?.size ?? 0;
+
+    if (req.method === 'POST' && p.action === 'login') return this.restLogin(p.adminId, res);
+    if (req.method === 'GET' && p.action === 'status') return this.restStatus(p.adminId, res);
+    if (req.method === 'DELETE' && p.action === null) {
+      void this.restLogout(p.adminId, res);
+      return;
+    }
+    res.writeHead(405).end();
+  }
+
+  /** POST /login — lazily create + connect the client; QR lands in the snapshot via onQR. */
+  private restLogin(adminId: string, res: ServerResponse): void {
+    this.getOrCreateClient(adminId);
+    const snap = this.state.get(adminId);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      adminId: p.adminId,
-      clientLoaded: !!client,
-      subscribers: subs,
-    }));
+    res.end(JSON.stringify({ status: snap?.status ?? 'qr_pending' }));
+  }
+
+  /** GET /status — return the live snapshot (qr only while pending). */
+  private restStatus(adminId: string, res: ServerResponse): void {
+    const snap = this.state.get(adminId) ?? { status: 'disconnected' };
+    const body: WaSnapshot = { status: snap.status };
+    if (snap.status === 'qr_pending' && snap.qr) body.qr = snap.qr;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  }
+
+  /** DELETE /wa/<id> — disconnect, drop subscribers, wipe authDir so fs-scan unloads it. */
+  private async restLogout(adminId: string, res: ServerResponse): Promise<void> {
+    const client = this.clients.get(adminId);
+    if (client) {
+      try {
+        await client.disconnect();
+      } catch (err) {
+        console.error(`[${adminId}] disconnect during logout failed:`, err);
+      }
+      this.clients.delete(adminId);
+    }
+    const subs = this.sockets.get(adminId);
+    if (subs) {
+      for (const ws of subs) ws.close();
+      this.sockets.delete(adminId);
+    }
+    // Remove on-disk auth so nanobot's fs-scan drops the channel and next login re-scans.
+    rmSync(join(this.authRoot, adminId), { recursive: true, force: true });
+    this.state.set(adminId, { status: 'logged_out' });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'logged_out' }));
   }
 
   async stop(): Promise<void> {
