@@ -47,6 +47,7 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private closing = false; // set by disconnect() so the close handler skips auto-reconnect
   private readonly authDir: string;
   private readonly mediaDir: string;
   private readonly logTag: string;
@@ -84,6 +85,7 @@ export class WhatsAppClient {
   }
 
   async connect(): Promise<void> {
+    this.closing = false; // reset, in case connect() runs on a recycled instance after disconnect()
     const logger = pino({ level: 'silent' });
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     const { version } = await fetchLatestBaileysVersion();
@@ -129,19 +131,31 @@ export class WhatsAppClient {
       }
 
       if (connection === 'close') {
+        // Intentional teardown (disconnect()): the bridge owns cleanup/state — don't reconnect.
+        if (this.closing) return;
+
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        const restartRequired = statusCode === DisconnectReason.restartRequired; // 515, fires after QR pairing
 
-        console.log(`${this.logTag} Connection closed. Status: ${statusCode}, Will reconnect: ${shouldReconnect}`);
-        this.options.onStatus('disconnected');
+        console.log(`${this.logTag} Connection closed. Status: ${statusCode}, Will reconnect: ${!loggedOut}`);
+        // loggedOut (401) is terminal — surface it distinctly so the bridge drops the dead
+        // client + creds. 515 is Baileys' internal "restart now" right after pairing, not a
+        // user-visible disconnect, so don't flip the UI to disconnected. Other drops do.
+        if (loggedOut) this.options.onStatus('logged_out');
+        else if (!restartRequired) this.options.onStatus('disconnected');
 
-        if (shouldReconnect && !this.reconnecting) {
+        if (!loggedOut && !this.reconnecting) {
           this.reconnecting = true;
-          console.log(`${this.logTag} Reconnecting in 5 seconds...`);
+          // Reconnect IMMEDIATELY on 515: a delay lets the just-completed pairing lapse, so
+          // the reconnect gets 401 (phone shows "can't link", forcing a re-scan). Real
+          // network drops back off 5s.
+          const delayMs = restartRequired ? 0 : 5000;
+          if (delayMs) console.log(`${this.logTag} Reconnecting in 5 seconds...`);
           setTimeout(() => {
             this.reconnecting = false;
             this.connect();
-          }, 5000);
+          }, delayMs);
         }
       } else if (connection === 'open') {
         console.log(`${this.logTag} ✅ Connected to WhatsApp`);
@@ -303,6 +317,7 @@ export class WhatsAppClient {
   }
 
   async disconnect(): Promise<void> {
+    this.closing = true;
     if (this.sock) {
       this.sock.end(undefined);
       this.sock = null;
