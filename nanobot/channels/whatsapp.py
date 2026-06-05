@@ -392,6 +392,18 @@ class WhatsAppChannel(BaseChannel):
                     # Drop the transcribed audio file from media — transcript is the content
                     continue
                 mime, _ = mimetypes.guess_type(p)
+
+                # Auto-transcribe audio document attachments (.wav, .mp3, .ogg, .m4a, etc.)
+                if mime and mime.startswith("audio/"):
+                    logger.info("Transcribing audio attachment {}...", p)
+                    transcription = await self.transcribe_audio(p)
+                    if transcription:
+                        tag = f"[音频文件转写] {transcription}"
+                        content = f"{content}\n{tag}" if content else tag
+                        logger.info("Transcribed audio attachment: {}...", transcription[:50])
+                        continue  # Don't add [file: /path] tag
+                    # Transcription failed — fall through to regular file tag
+
                 media_type = "image" if mime and mime.startswith("image/") else "file"
                 media_tag = f"[{media_type}: {p}]"
                 content = f"{content}\n{media_tag}" if content else media_tag
