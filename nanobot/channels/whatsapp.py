@@ -376,7 +376,7 @@ class WhatsAppChannel(BaseChannel):
                     logger.info("Transcribing voice message from {}...", sender_id)
                     transcription = await self.transcribe_audio(media_paths[0])
                     if transcription:
-                        content = transcription
+                        content = f"[语音消息转写] {transcription}"
                         voice_transcribed = True
                         logger.info("Transcribed voice from {}: {}...", sender_id, transcription[:50])
                     else:
