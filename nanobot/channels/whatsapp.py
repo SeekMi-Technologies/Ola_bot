@@ -319,10 +319,13 @@ class WhatsAppChannel(BaseChannel):
         if not url:
             return None
         token = self.config.crm_service_token or os.environ.get("MCP_SERVICE_TOKEN", "")
-        admin_id = self._admin_id
-        if not token or not admin_id:
-            logger.debug("[crm-upload] skipped: no token or admin_id")
+        if not token:
+            logger.debug("[crm-upload] skipped: no service token")
             return None
+
+        # admin_id may be empty in single-tenant dev mode.
+        # The server will fall back to system admin when X-Acting-As is absent.
+        admin_id = self._admin_id
 
         try:
             import httpx
@@ -334,15 +337,15 @@ class WhatsAppChannel(BaseChannel):
 
             mime = mimetypes.guess_type(str(p))[0] or "audio/ogg"
             endpoint = f"{url}/internal/upload-audio"
+            headers = {"Authorization": f"Bearer {token}"}
+            if admin_id:
+                headers["X-Acting-As"] = admin_id
             async with httpx.AsyncClient(timeout=30) as client:
                 with open(p, "rb") as f:
                     resp = await client.post(
                         endpoint,
                         files={"file": (p.name, f, mime)},
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "X-Acting-As": admin_id,
-                        },
+                        headers=headers,
                     )
                 if resp.status_code >= 400:
                     logger.warning("[crm-upload] {} returned {}: {}", endpoint, resp.status_code, resp.text[:200])
