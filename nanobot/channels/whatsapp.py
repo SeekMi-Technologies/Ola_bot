@@ -423,12 +423,15 @@ class WhatsAppChannel(BaseChannel):
             voice_transcribed = False
             if content == "[Voice Message]":
                 if media_paths:
-                    # Upload to CRM in background (non-blocking; fire-and-forget)
-                    asyncio.create_task(self._upload_audio_to_crm(media_paths[0]))
+                    # Upload to CRM first (await so agent knows fileId)
+                    crm_result = await self._upload_audio_to_crm(media_paths[0])
+                    crm_file_tag = ""
+                    if crm_result and crm_result.get("fileId"):
+                        crm_file_tag = f"\n[CRM文件已上传 fileId={crm_result['fileId']}]"
                     logger.info("Transcribing voice message from {}...", sender_id)
                     transcription = await self.transcribe_audio(media_paths[0])
                     if transcription:
-                        content = f"[语音消息转写] {transcription}"
+                        content = f"[语音消息转写] {transcription}{crm_file_tag}"
                         voice_transcribed = True
                         logger.info("Transcribed voice from {}: {}...", sender_id, transcription[:50])
                     else:
@@ -447,12 +450,14 @@ class WhatsAppChannel(BaseChannel):
 
                 # Auto-transcribe audio document attachments (.wav, .mp3, .ogg, .m4a, etc.)
                 if mime and mime.startswith("audio/"):
-                    # Upload to CRM in background (non-blocking)
-                    asyncio.create_task(self._upload_audio_to_crm(p))
+                    # Upload to CRM first (await so agent knows fileId)
+                    crm_result = await self._upload_audio_to_crm(p)
                     logger.info("Transcribing audio attachment {}...", p)
                     transcription = await self.transcribe_audio(p)
                     if transcription:
                         tag = f"[音频文件转写] {transcription}"
+                        if crm_result and crm_result.get("fileId"):
+                            tag += f"\n[CRM文件已上传 fileId={crm_result['fileId']}]"
                         content = f"{content}\n{tag}" if content else tag
                         logger.info("Transcribed audio attachment: {}...", transcription[:50])
                         continue  # Don't add [file: /path] tag
