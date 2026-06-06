@@ -46,6 +46,11 @@ class WhatsAppConfig(Base):
     transcription_api_key: str = ""
     transcription_api_base: str = ""
     transcription_language: str | None = None
+    # CRM audio upload — upload inbound WhatsApp audio to CRM File storage
+    # so the agent can use file.transcribe / file.get_transcript MCP tools.
+    # Format: http://<host>:<port> (no trailing slash). Empty = disabled.
+    crm_upload_url: str = ""
+    crm_service_token: str = ""  # Bearer token; defaults to MCP_SERVICE_TOKEN env
 
 
 def _bridge_token_path() -> Path:
@@ -304,6 +309,51 @@ class WhatsAppChannel(BaseChannel):
                 logger.error("Error sending WhatsApp media {}: {}", media_path, e)
                 raise
 
+    async def _upload_audio_to_crm(self, file_path: str) -> dict | None:
+        """Upload an audio file to CRM via the internal upload-audio endpoint.
+
+        Returns the JSON response body on success (contains fileId, transcriptionJobId),
+        or None on any error (logged, non-blocking).
+        """
+        url = self.config.crm_upload_url
+        if not url:
+            return None
+        token = self.config.crm_service_token or os.environ.get("MCP_SERVICE_TOKEN", "")
+        admin_id = self._admin_id
+        if not token or not admin_id:
+            logger.debug("[crm-upload] skipped: no token or admin_id")
+            return None
+
+        try:
+            import httpx
+
+            p = Path(file_path)
+            if not p.exists():
+                logger.warning("[crm-upload] file not found: {}", file_path)
+                return None
+
+            mime = mimetypes.guess_type(str(p))[0] or "audio/ogg"
+            endpoint = f"{url}/internal/upload-audio"
+            async with httpx.AsyncClient(timeout=30) as client:
+                with open(p, "rb") as f:
+                    resp = await client.post(
+                        endpoint,
+                        files={"file": (p.name, f, mime)},
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "X-Acting-As": admin_id,
+                        },
+                    )
+                if resp.status_code >= 400:
+                    logger.warning("[crm-upload] {} returned {}: {}", endpoint, resp.status_code, resp.text[:200])
+                    return None
+                data = resp.json()
+                logger.info("[crm-upload] uploaded {} → fileId={} deduped={}", p.name, data.get("fileId"), data.get("deduped"))
+                return data
+        except Exception as e:
+            logger.warning("[crm-upload] failed for {}: {}", file_path, e)
+            return None
+
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""
         try:
@@ -373,6 +423,8 @@ class WhatsAppChannel(BaseChannel):
             voice_transcribed = False
             if content == "[Voice Message]":
                 if media_paths:
+                    # Upload to CRM in background (non-blocking; fire-and-forget)
+                    asyncio.create_task(self._upload_audio_to_crm(media_paths[0]))
                     logger.info("Transcribing voice message from {}...", sender_id)
                     transcription = await self.transcribe_audio(media_paths[0])
                     if transcription:
@@ -395,6 +447,8 @@ class WhatsAppChannel(BaseChannel):
 
                 # Auto-transcribe audio document attachments (.wav, .mp3, .ogg, .m4a, etc.)
                 if mime and mime.startswith("audio/"):
+                    # Upload to CRM in background (non-blocking)
+                    asyncio.create_task(self._upload_audio_to_crm(p))
                     logger.info("Transcribing audio attachment {}...", p)
                     transcription = await self.transcribe_audio(p)
                     if transcription:
