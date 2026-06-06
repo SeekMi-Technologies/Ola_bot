@@ -19,6 +19,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createHmac } from 'crypto';
+import { createServer as createNetServer } from 'net';
 import { BridgeServer, parseWaPath } from '../server.js';
 
 const ID = 'a'.repeat(24); // valid 24-hex adminId
@@ -94,6 +95,39 @@ function withServer(
     }
   };
 }
+
+// ---- fixed bind/port (2a) -------------------------------------------------
+
+/** Probe a free ephemeral port by binding :0, reading it, then releasing it. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createNetServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const addr = probe.address();
+      if (addr && typeof addr === 'object') probe.close(() => resolve(addr.port));
+      else reject(new Error('could not determine free port'));
+    });
+  });
+}
+
+test('BridgeServer honors a fixed port + bindHost (portfile records the configured port)', async () => {
+  const authRoot = mkdtempSync(join(tmpdir(), 'bridge-port-'));
+  const port = await freePort();
+  const server = new BridgeServer(authRoot, SECRET, undefined, '127.0.0.1', port);
+  try {
+    await server.start();
+    const written = Number(readFileSync(join(authRoot, 'bridge.port'), 'utf-8').trim());
+    assert.equal(written, port, 'portfile must record the configured fixed port, not a random one');
+    const res = await fetch(`http://127.0.0.1:${port}/wa/${ID}/status`, {
+      headers: { Authorization: `Bearer ${createHmac('sha256', SECRET).update(ID).digest('hex')}` },
+    });
+    assert.equal(res.status, 200, 'server must actually be listening on the configured port');
+  } finally {
+    await server.stop().catch((e) => console.warn('test server stop failed:', (e as Error)?.message));
+    rmSync(authRoot, { recursive: true, force: true });
+  }
+});
 
 test(
   'REST GET /status with valid token, no client → 200 {status:disconnected}',

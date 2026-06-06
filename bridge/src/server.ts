@@ -2,7 +2,8 @@
  * WebSocket + HTTP server for the multi-tenant Python ↔ Node bridge.
  *
  * Security:
- * - Binds to 127.0.0.1 only.
+ * - Binds to BRIDGE_BIND_HOST (default 127.0.0.1). Prod (Box2) sets 0.0.0.0 so
+ *   the cross-host CRM (Box1) can reach it over the Tailscale NIC.
  * - Rejects browser-originated WebSocket connections (Origin header present).
  * - Per-admin token = HMAC-SHA256(MCP_SERVICE_TOKEN, adminId) — same secret on
  *   bridge/nanobot/CRM, so all three derive identical tokens with no shared table.
@@ -106,6 +107,11 @@ export class BridgeServer {
     private authRoot: string,
     private serviceSecret: string,
     private singleAdminId?: string,
+    // Bind interface + fixed port. Defaults preserve dev behavior (loopback +
+    // OS-assigned port discovered via portfile). index.ts validates env and
+    // passes prod values; callers that omit these (e.g. tests) get the defaults.
+    private bindHost: string = '127.0.0.1',
+    private port: number = 0,
   ) {}
 
   /** Per-admin token: HMAC-SHA256(MCP_SERVICE_TOKEN, adminId). */
@@ -135,17 +141,18 @@ export class BridgeServer {
 
     this.http.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket as Socket, head));
 
-    // listen(0) → OS picks any free port; write actual port to portfile
+    // port=0 → OS picks any free port (dev); fixed port → prod. Either way the
+    // actual bound port is written to the portfile for same-host discovery.
     await new Promise<void>((resolve, reject) => {
       this.http!.once('error', reject);
-      this.http!.listen(0, '127.0.0.1', () => {
+      this.http!.listen(this.port, this.bindHost, () => {
         const addr = this.http!.address();
         if (addr && typeof addr === 'object') {
           const port = addr.port;
           const portFile = this.portFilePath();
           mkdirSync(dirname(portFile), { recursive: true });
           writeFileSync(portFile, String(port), { encoding: 'utf-8' });
-          console.log(`🌉 Bridge listening on ws://127.0.0.1:${port}`);
+          console.log(`🌉 Bridge listening on ws://${this.bindHost}:${port}`);
           console.log(`📂 authRoot=${this.authRoot}`);
           console.log(`📄 portfile=${portFile}`);
           if (this.singleAdminId) {
