@@ -224,7 +224,10 @@ export class WhatsAppClient {
     try {
       await mkdir(this.mediaDir, { recursive: true });
 
-      const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;
+      const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+        reuploadRequest: this.sock.updateMediaMessage.bind(this.sock),
+        logger: pino({ level: 'silent' }),
+      }) as Buffer;
 
       let outFilename: string;
       if (fileName) {
@@ -242,8 +245,10 @@ export class WhatsAppClient {
       await writeFile(filepath, buffer);
 
       return filepath;
-    } catch (err) {
-      console.error(`${this.logTag} Failed to download media:`, err);
+    } catch (err: any) {
+      const status = err?.output?.statusCode ?? err?.status ?? '(no status)';
+      const reason = err?.message ?? String(err);
+      console.error(`${this.logTag} Failed to download media: status=${status} reason=${reason}`);
       return null;
     }
   }
