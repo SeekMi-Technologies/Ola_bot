@@ -1,0 +1,140 @@
+name: Claude Auto Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "**/*.snap"
+
+jobs:
+  claude-review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Auto-review this nanobot pull request. The PR branch is already
+            checked out — Read/Grep the surrounding code to confirm a finding
+            before posting it.
+
+            SeekMi-Technologies/Ola_bot is a downstream fork of HKUDS/nanobot,
+            the Python AI agent that powers Ola (an AI-native foreign-trade
+            sales platform). It runs as two processes: `serve` exposes an
+            OpenAI-compatible /v1/chat/completions to the CRM (askola), and
+            `gateway` runs the ChannelManager (WhatsApp/email/etc.). Keep it
+            a Python microservice — do NOT rewrite agent logic in Node.js (the
+            bridge/ Baileys layer is the only Node component). Focus on issues
+            that actually break Ola in production.
+
+            ## Primary goal: prevent bloat — reuse over reinvention
+
+            This is a small fork that bloats fast when new code copies logic
+            instead of extending the established base classes / registries.
+            Before flagging duplication, Grep to confirm the abstraction
+            exists and cite the file the author should have reused. The five
+            canonical reuse rules (block PR on violation):
+            - CHANNELS: a new channel subclasses channels/base.py BaseChannel
+              (implement start/stop/send, forward inbound via
+              self._handle_message) and is discovered via pkgutil/entry_points
+              — never hand-roll its own `while True` listen loop or manual
+              registration. See channels/telegram.py, channels/whatsapp.py.
+            - PROVIDERS: a new LLM provider extends providers/base.py
+              LLMProvider and is declared as a ProviderSpec in
+              providers/registry.py (the single source of truth) — never
+              copy another provider's chat()/retry/error logic, never hardcode
+              model ids or api_base in loop/runner. Config fields are derived
+              from the registry, not added by hand.
+            - TOOLS: a new tool subclasses agent/tools/base.py Tool and is
+              registered via ToolRegistry in AgentLoop._register_default_tools
+              — never bypass the registry or build a parallel execute path.
+            - ADMIN SCOPING: per-admin identity flows through
+              agent/admin_context.py ContextVar + get_admin_dir_name() and the
+              SessionManager — never hardcode workspace/admins/<id> paths or
+              fork per-admin copies of loop/runner/memory.
+            - MCP CLIENTS: outbound MCP calls go through MCPClientPool
+              (agent/tools/mcp.py) which bakes X-Acting-As into per-identity
+              connection headers — never spawn a standalone ClientSession /
+              streamable_http_client / sse_client elsewhere.
+            Also: the outbound progress/tool-hint filter lives once in
+            channels/manager.py — a channel must NOT re-check `_progress` /
+            `_tool_hint` / `_retry_wait` in its own send().
+
+            ## Multi-tenant data isolation (highest priority)
+            - The MCP client transport must NEVER collapse acting-as identity
+              across users. A single httpx.AsyncClient or ClientSession reused
+              across admins is the Phase ISO bug class (post_writer task
+              contextvar freeze) — flag it.
+            - X-Acting-As must be baked into connection-level headers per
+              identity (MCPClientPool), not injected via an httpx event_hook
+              reading a ContextVar at request time.
+            - set_acting_as / _acting_as_ctx changes must propagate from the
+              caller's task to the actual outgoing MCP HTTP request. Any
+              asyncio.create_task / anyio task group with a long-lived
+              background task reading the contextvar inside is a likely
+              regression of the same bug.
+
+            ## Robustness red lines
+            - No silent except blocks; every except returns or logs with type
+              and message. CancelledError must be re-raised when the current
+              task was externally cancelled (the /stop pattern).
+            - No asyncio.sleep used to fake async; only real awaits.
+            - asyncio.create_task'd tasks must be tracked so shutdown can
+              drain them — orphan tasks leak.
+            - No mock-only tests for SDK transports (streamable_http_client,
+              ClientSession, sse_client, stdio_client) — a documented
+              false-positive class here. See
+              tests/agent/test_mcp_pool_real_transport.py for the
+              real-transport pattern.
+            - No `-preview` or otherwise unpinned LLM model ids in prod config
+              — silent upstream removal has caused live outages.
+
+            ## Email channel
+            - sender → admin._id resolution (salesperson.lookup_by_email) must
+              happen BEFORE dispatching to the agent loop, propagated as
+              metadata['_acting_as'].
+            - Unknown senders trigger an unknown-sender reply and must NOT
+              dispatch to the agent (no doc creation).
+            - IMAP UNSEEN race: appended emails sometimes carry \Seen
+              automatically (Zoho); test harnesses must pass empty flags on
+              append.
+
+            ## How to post the review (keep it to one clean pass)
+            - Post exactly ONE top-level summary with `gh pr comment`. Lead
+              with bloat/reuse findings, then isolation/correctness, then the
+              rest.
+            - Use `mcp__github_inline_comment__create_inline_comment` (with
+              `confirmed: true`) ONLY for the highest-severity violations —
+              at most 6 inline comments total.
+            - Only post GitHub comments. Do NOT submit review text as chat
+              messages and do NOT open a formal PR review.
+            - One short sentence per issue: file:line + what breaks (or what
+              it duplicates) + the fix (name the abstraction to reuse). No
+              Todo lists, checkboxes, progress logs, "Fix this →" deep-links,
+              emoji, restating the diff, or generic praise.
+            - Skip fixtures, .md files, and lockfiles. Do review test files
+              (the mock-transport rule depends on it).
+            - If the PR is clean, post a one-sentence summary and stop.
+          claude_args: |
+            --max-turns 25
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checks:*)"
