@@ -298,9 +298,11 @@ class AgentLoop:
             provider=provider,
             model=self.model,
         )
-        self._register_default_tools()
-        if _tc.my.enable:
-            self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
+        # mcp_only: channel-facing agent gets MCP tools only (set in _connect_mcp).
+        if not _tc.mcp_only:
+            self._register_default_tools()
+            if _tc.my.enable:
+                self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
         self.commands = CommandRouter()
