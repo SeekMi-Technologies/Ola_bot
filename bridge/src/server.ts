@@ -302,6 +302,12 @@ export class BridgeServer {
   }
 
   private handleRest(req: IncomingMessage, res: ServerResponse): void {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+
     const p = parseWaPath(req.url);
     if (!p) {
       res.writeHead(404).end();

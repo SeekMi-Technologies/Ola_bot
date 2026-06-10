@@ -30,7 +30,7 @@ RUN uv pip install --system --no-cache .
 WORKDIR /app/bridge
 RUN git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/ && \
     git config --global --add url."https://github.com/".insteadOf git@github.com: && \
-    npm install && npm run build
+    npm ci && npm run build
 WORKDIR /app
 
 # Create non-root user and config directory
