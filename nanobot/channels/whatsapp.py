@@ -324,7 +324,8 @@ class WhatsAppChannel(BaseChannel):
             return None
 
         # admin_id may be empty in single-tenant dev mode.
-        # The server will fall back to system admin when X-Acting-As is absent.
+        # Without X-Acting-As the server returns 401 — CRM upload is a
+        # no-op in that case (logged, non-blocking).
         admin_id = self._admin_id
 
         try:
