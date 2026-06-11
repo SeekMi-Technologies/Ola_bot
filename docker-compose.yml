@@ -2,6 +2,8 @@ x-common-config: &common-config
   build:
     context: .
     dockerfile: Dockerfile
+  environment:
+    MCP_SERVICE_TOKEN: ${MCP_SERVICE_TOKEN:?MCP_SERVICE_TOKEN is required}
   volumes:
     - ${NANOBOT_STATE_DIR:?NANOBOT_STATE_DIR is required}:/home/nanobot/.nanobot
   cap_drop:
