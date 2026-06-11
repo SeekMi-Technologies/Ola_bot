@@ -22,6 +22,7 @@ import subprocess
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from loguru import logger
 from pydantic import Field
@@ -208,16 +209,18 @@ class WhatsAppChannel(BaseChannel):
             return self.config.bridge_url
 
         base_url = self.config.bridge_url
-        wa_root = Path.home() / ".nanobot" / "wa"
-        for portfile in (wa_root / self._admin_id / "port", wa_root / "bridge.port"):
-            if portfile.exists():
-                try:
-                    port = int(portfile.read_text().strip())
-                    if port > 0:
-                        base_url = f"ws://127.0.0.1:{port}"
-                        break
-                except (ValueError, OSError):
-                    continue
+        parsed = urlparse(base_url)
+        if parsed.hostname in {None, "localhost", "127.0.0.1", "::1"}:
+            wa_root = Path.home() / ".nanobot" / "wa"
+            for portfile in (wa_root / self._admin_id / "port", wa_root / "bridge.port"):
+                if portfile.exists():
+                    try:
+                        port = int(portfile.read_text().strip())
+                        if port > 0:
+                            base_url = f"ws://127.0.0.1:{port}"
+                            break
+                    except (ValueError, OSError):
+                        continue
 
         token = self._effective_bridge_token()
         return f"{base_url}/wa/{self._admin_id}?token={token}"
