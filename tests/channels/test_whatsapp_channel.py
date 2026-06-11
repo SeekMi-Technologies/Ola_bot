@@ -270,6 +270,40 @@ def test_effective_bridge_token_raises_when_admin_id_set_but_secret_missing(monk
         ch._effective_bridge_token()
 
 
+def test_resolve_ws_url_uses_portfile_for_loopback_bridge(monkeypatch, tmp_path):
+    admin_id = "507f1f77bcf86cd799439011"
+    monkeypatch.setenv("MCP_SERVICE_TOKEN", "TEST_SECRET_123")
+    monkeypatch.setattr("nanobot.channels.whatsapp.Path.home", lambda: tmp_path)
+    wa_root = tmp_path / ".nanobot" / "wa"
+    wa_root.mkdir(parents=True)
+    (wa_root / "bridge.port").write_text("4321")
+
+    ch = WhatsAppChannel(
+        {"enabled": True, "adminId": admin_id, "bridgeUrl": "ws://127.0.0.1:3001"},
+        MagicMock(),
+    )
+
+    assert ch._resolve_ws_url().startswith(f"ws://127.0.0.1:4321/wa/{admin_id}?token=")
+
+
+def test_resolve_ws_url_preserves_remote_bridge_host(monkeypatch, tmp_path):
+    admin_id = "507f1f77bcf86cd799439011"
+    monkeypatch.setenv("MCP_SERVICE_TOKEN", "TEST_SECRET_123")
+    monkeypatch.setattr("nanobot.channels.whatsapp.Path.home", lambda: tmp_path)
+    wa_root = tmp_path / ".nanobot" / "wa"
+    wa_root.mkdir(parents=True)
+    (wa_root / "bridge.port").write_text("4321")
+
+    ch = WhatsAppChannel(
+        {"enabled": True, "adminId": admin_id, "bridgeUrl": "ws://nanobot-bridge:3001"},
+        MagicMock(),
+    )
+
+    assert ch._resolve_ws_url().startswith(
+        f"ws://nanobot-bridge:3001/wa/{admin_id}?token="
+    )
+
+
 @pytest.mark.asyncio
 async def test_start_uses_multi_tenant_url_when_admin_id_set(monkeypatch, tmp_path):
     """Multi-tenant mode: ws_url = <base>/wa/<adminId>?token=<hmac>; no auth msg sent."""

@@ -130,6 +130,15 @@ test('BridgeServer honors a fixed port + bindHost (portfile records the configur
 });
 
 test(
+  'REST GET /health requires no credentials',
+  withServer(async ({ base }) => {
+    const res = await fetch(`${base}/health`);
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { status: 'ok' });
+  })
+);
+
+test(
   'REST GET /status with valid token, no client → 200 {status:disconnected}',
   withServer(async ({ base, tokenFor }) => {
     const res = await fetch(`${base}/wa/${ID}/status`, {

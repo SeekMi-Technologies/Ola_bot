@@ -30,7 +30,7 @@ RUN uv pip install --system --no-cache .
 WORKDIR /app/bridge
 RUN git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/ && \
     git config --global --add url."https://github.com/".insteadOf git@github.com: && \
-    npm install && npm run build
+    npm ci && npm run build
 WORKDIR /app
 
 # Create non-root user and config directory
@@ -44,8 +44,8 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/ent
 USER nanobot
 ENV HOME=/home/nanobot
 
-# Gateway default port
-EXPOSE 18790
+# serve API, gateway, WhatsApp bridge
+EXPOSE 8900 8901 3001
 
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["status"]

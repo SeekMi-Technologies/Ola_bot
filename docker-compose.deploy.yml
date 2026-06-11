@@ -1,0 +1,20 @@
+services:
+  nanobot-gateway:
+    image: ghcr.io/seekmi-technologies/ola-nanobot:${NANOBOT_IMAGE_TAG:?NANOBOT_IMAGE_TAG is required}
+    pull_policy: always
+    build: !reset null
+
+  nanobot-api:
+    image: ghcr.io/seekmi-technologies/ola-nanobot:${NANOBOT_IMAGE_TAG:?NANOBOT_IMAGE_TAG is required}
+    pull_policy: always
+    build: !reset null
+
+  nanobot-bridge:
+    image: ghcr.io/seekmi-technologies/ola-nanobot:${NANOBOT_IMAGE_TAG:?NANOBOT_IMAGE_TAG is required}
+    pull_policy: always
+    build: !reset null
+
+  nanobot-cli:
+    image: ghcr.io/seekmi-technologies/ola-nanobot:${NANOBOT_IMAGE_TAG:?NANOBOT_IMAGE_TAG is required}
+    pull_policy: always
+    build: !reset null

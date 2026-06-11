@@ -2,8 +2,10 @@ x-common-config: &common-config
   build:
     context: .
     dockerfile: Dockerfile
+  environment:
+    MCP_SERVICE_TOKEN: ${MCP_SERVICE_TOKEN:?MCP_SERVICE_TOKEN is required}
   volumes:
-    - ~/.nanobot:/home/nanobot/.nanobot
+    - ${NANOBOT_STATE_DIR:?NANOBOT_STATE_DIR is required}:/home/nanobot/.nanobot
   cap_drop:
     - ALL
   cap_add:
@@ -16,10 +18,10 @@ services:
   nanobot-gateway:
     container_name: nanobot-gateway
     <<: *common-config
-    command: ["gateway"]
+    command: ["gateway", "--port", "8901"]
     restart: unless-stopped
     ports:
-      - 18790:18790
+      - "${NANOBOT_BIND_ADDR:-127.0.0.1}:8901:8901"
     deploy:
       resources:
         limits:
@@ -33,10 +35,10 @@ services:
     container_name: nanobot-api
     <<: *common-config
     command:
-      ["serve", "--host", "0.0.0.0", "-w", "/home/nanobot/.nanobot/api-workspace"]
+      ["serve", "--host", "0.0.0.0", "--port", "8900", "-w", "/home/nanobot/.nanobot/api-workspace"]
     restart: unless-stopped
     ports:
-      - 127.0.0.1:8900:8900
+      - "${NANOBOT_BIND_ADDR:-127.0.0.1}:8900:8900"
     deploy:
       resources:
         limits:
@@ -45,6 +47,32 @@ services:
         reservations:
           cpus: "0.25"
           memory: 256M
+
+  nanobot-bridge:
+    container_name: nanobot-bridge
+    <<: *common-config
+    # Node-only service, no bubblewrap: keep cap_drop ALL but skip the
+    # SYS_ADMIN/apparmor/seccomp relaxations the Python processes need.
+    cap_add: []
+    security_opt: []
+    entrypoint: ["node"]
+    command: ["/app/bridge/dist/index.js"]
+    environment:
+      MCP_SERVICE_TOKEN: ${MCP_SERVICE_TOKEN:?MCP_SERVICE_TOKEN is required}
+      AUTH_ROOT: /home/nanobot/.nanobot/wa
+      BRIDGE_BIND_HOST: 0.0.0.0
+      BRIDGE_PORT: "3001"
+    restart: unless-stopped
+    ports:
+      - "${BRIDGE_BIND_ADDR:-127.0.0.1}:3001:3001"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
 
   nanobot-cli:
     <<: *common-config
