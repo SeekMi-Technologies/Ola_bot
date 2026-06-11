@@ -63,7 +63,7 @@ jobs:
 
   notify-staging:
     name: Notify Ola staging
-    if: github.ref_name == 'ola-dev' || github.ref_name == 'docker-CD'
+    if: github.ref_name == 'ola-dev'
     needs: build-push
     runs-on: ubuntu-latest
     steps:
