@@ -20,6 +20,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { createHmac } from 'crypto';
 import { createServer as createNetServer } from 'net';
+import { WebSocket } from 'ws';
 import { BridgeServer, parseWaPath } from '../server.js';
 
 const ID = 'a'.repeat(24); // valid 24-hex adminId
@@ -78,6 +79,7 @@ function withServer(
     base: string;
     tokenFor: (id: string) => string;
     authRoot: string;
+    server: BridgeServer;
   }) => Promise<void>
 ): () => Promise<void> {
   return async () => {
@@ -88,7 +90,7 @@ function withServer(
       // start() inside try so a bind failure still hits the finally (no tempdir leak).
       await server.start();
       const port = Number(readFileSync(join(authRoot, 'bridge.port'), 'utf-8').trim());
-      await fn({ base: `http://127.0.0.1:${port}`, tokenFor, authRoot });
+      await fn({ base: `http://127.0.0.1:${port}`, tokenFor, authRoot, server });
     } finally {
       await server.stop().catch((e) => console.warn('test server stop failed:', (e as Error)?.message));
       rmSync(authRoot, { recursive: true, force: true });
@@ -139,13 +141,30 @@ test(
 );
 
 test(
-  'REST GET /status with valid token, no client → 200 {status:disconnected}',
+  'REST GET /status with valid token, no client → 200 {status:disconnected, gatewayClients:0}',
   withServer(async ({ base, tokenFor }) => {
     const res = await fetch(`${base}/wa/${ID}/status`, {
       headers: { Authorization: `Bearer ${tokenFor(ID)}` },
     });
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { status: 'disconnected' });
+    assert.deepEqual(await res.json(), { status: 'disconnected', gatewayClients: 0 });
+  })
+);
+
+test(
+  'REST GET /status counts only OPEN gateway subscribers',
+  withServer(async ({ base, tokenFor, server }) => {
+    // Inject fake subscriber sockets directly: a real WS attach would lazily
+    // spin a Baileys client (network), which this suite deliberately avoids.
+    // close() must exist — server.stop() closes every subscriber.
+    const fake = (readyState: number) => ({ readyState, close: () => {} });
+    const sockets = (server as any).sockets as Map<string, Set<unknown>>;
+    sockets.set(ID, new Set([fake(WebSocket.OPEN), fake(WebSocket.CLOSED)]));
+    const res = await fetch(`${base}/wa/${ID}/status`, {
+      headers: { Authorization: `Bearer ${tokenFor(ID)}` },
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { status: 'disconnected', gatewayClients: 1 });
   })
 );
 
