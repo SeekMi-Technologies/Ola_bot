@@ -10,7 +10,7 @@ name: Build & Push Image
 
 on:
   push:
-    branches: [ola-main, ola-dev]
+    branches: [ola-main, ola-dev, docker-CD]
   workflow_dispatch:
 
 concurrency:
