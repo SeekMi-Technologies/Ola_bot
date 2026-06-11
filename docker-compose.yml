@@ -51,6 +51,10 @@ services:
   nanobot-bridge:
     container_name: nanobot-bridge
     <<: *common-config
+    # Node-only service, no bubblewrap: keep cap_drop ALL but skip the
+    # SYS_ADMIN/apparmor/seccomp relaxations the Python processes need.
+    cap_add: []
+    security_opt: []
     entrypoint: ["node"]
     command: ["/app/bridge/dist/index.js"]
     environment:
