@@ -78,6 +78,13 @@ class MemoryStore:
         # Global, per-tenant. Stays at workspace root until multi-customer.
         return self.workspace / "SOUL.md"
 
+    def resolve_overridable_file(self, filename: str) -> Path:
+        """Read-time resolution for a per-admin-overridable bootstrap file:
+        admins/<acting-id>/<filename> if it exists, else the global
+        workspace-root file. Read-only — no copies, no writes, no dir creation."""
+        per_admin = self.workspace / "admins" / get_admin_dir_name() / filename
+        return per_admin if per_admin.exists() else self.workspace / filename
+
     @property
     def _cursor_file(self) -> Path:
         return self.memory_dir / ".cursor"
