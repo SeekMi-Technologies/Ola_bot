@@ -31,26 +31,26 @@ _acting_admin_ctx: ContextVar[str | None] = ContextVar(
 )
 
 
+def is_valid_admin_id(value: str | None) -> bool:
+    """True if *value* is a non-empty, path-traversal-safe admin id."""
+    return bool(isinstance(value, str) and _ADMIN_ID_RE.fullmatch(value.strip()))
+
+
 def set_acting_admin_id(value: str | None) -> None:
     """Store the current request's acting-admin id. Empty/whitespace/
     non-string + path-traversal-unsafe values normalize to None, which
     routes the request to workspace/admins/_system/."""
-    if value is None or not isinstance(value, str):
-        _acting_admin_ctx.set(None)
+    if is_valid_admin_id(value):
+        _acting_admin_ctx.set(value.strip())
         return
-    trimmed = value.strip()
-    if not trimmed:
-        _acting_admin_ctx.set(None)
-        return
-    if not _ADMIN_ID_RE.fullmatch(trimmed):
+    trimmed = value.strip() if isinstance(value, str) else ""
+    if trimmed:
         logger.warning(
             "Rejected unsafe acting-admin id (path traversal / invalid chars): "
             "{!r} — falling back to SYSTEM_ADMIN_ID",
             trimmed[:64],
         )
-        _acting_admin_ctx.set(None)
-        return
-    _acting_admin_ctx.set(trimmed)
+    _acting_admin_ctx.set(None)
 
 
 def get_acting_admin_id() -> str | None:

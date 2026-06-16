@@ -508,8 +508,8 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     for item in tpl.iterdir():
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    _write(None, workspace / "memory" / "history.jsonl")
+    # memory/ is per-admin now (admins/<id>/memory, seeded by provision_admin);
+    # no root memory/ seeding.
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:
@@ -535,3 +535,50 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         logger.warning("Failed to initialize git store for {}", workspace)
 
     return added
+
+
+# Per-admin files seeded from the workspace-root template (the Ola template
+# synced there on deploy / start-dev) — never from nanobot's bundled template,
+# so a template update reaches new admins. AGENTS.md is intentionally excluded:
+# it is the global security layer and must never be per-admin.
+_PER_ADMIN_SEED_FILES = ("USER.md", "SOUL.md", "TOOLS.md")
+
+
+def provision_admin(workspace: Path, admin_id: str | None) -> bool:
+    """Lazily create a per-admin workspace skeleton. Idempotent and never
+    overwrites; returns True only if it created something.
+
+    Seeds USER.md / SOUL.md / TOOLS.md from the matching workspace-root file
+    (the Ola templates). AGENTS.md stays global (not seeded). MEMORY.md /
+    history.jsonl start empty. _system, None, and path-traversal-unsafe ids
+    are no-ops (no dir created).
+    """
+    from nanobot.agent.admin_context import SYSTEM_ADMIN_ID, is_valid_admin_id
+
+    if admin_id == SYSTEM_ADMIN_ID or not is_valid_admin_id(admin_id):
+        return False
+
+    admin_dir = workspace / "admins" / admin_id
+    marker = admin_dir / ".provisioned"
+    if marker.exists():  # fast path — keeps repeat messages zero-write
+        return False
+
+    ensure_dir(admin_dir / "memory")
+    ensure_dir(admin_dir / "sessions")
+
+    for filename in _PER_ADMIN_SEED_FILES:
+        dest = admin_dir / filename
+        if dest.exists():
+            continue
+        root_template = workspace / filename
+        if root_template.exists():
+            _write_text_atomic(dest, root_template.read_text(encoding="utf-8"))
+        else:
+            logger.warning("provision_admin: workspace-root {} missing; skipped seeding it for {}", filename, admin_id)
+
+    for empty_file in (admin_dir / "memory" / "MEMORY.md", admin_dir / "memory" / "history.jsonl"):
+        if not empty_file.exists():
+            _write_text_atomic(empty_file, "")
+
+    _write_text_atomic(marker, "")
+    return True

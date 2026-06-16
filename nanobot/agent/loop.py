@@ -15,6 +15,7 @@ from loguru import logger
 
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.admin_context import get_acting_admin_id
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
@@ -45,7 +46,7 @@ from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents
-from nanobot.utils.helpers import image_placeholder_text
+from nanobot.utils.helpers import image_placeholder_text, provision_admin
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
@@ -685,6 +686,7 @@ class AgentLoop:
         # propagate across the bus queue, so channels carry it via metadata.
         _acting = (msg.metadata or {}).get("_acting_as")
         set_acting_as(_acting)
+        provision_admin(self.workspace, get_acting_admin_id())
 
         # Mirror process_direct: retry MCP connection on every message so a
         # startup race (port-up before protocol-ready) does not leave bus
