@@ -341,7 +341,7 @@ class WhatsAppChannel(BaseChannel):
 
             mime = mimetypes.guess_type(str(p))[0] or "audio/ogg"
             endpoint = f"{url}/internal/upload-audio"
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {token}", "X-Skip-Transcription": "true"}
             if admin_id:
                 headers["X-Acting-As"] = admin_id
             async with httpx.AsyncClient(timeout=30) as client:
@@ -360,6 +360,40 @@ class WhatsAppChannel(BaseChannel):
         except Exception as e:
             logger.warning("[crm-upload] failed for {}: {}", file_path, e)
             return None
+
+    async def _store_transcript_to_crm(self, file_id: str, text: str) -> None:
+        """Write nanobot's transcript result to CRM so file.get_transcript MCP tool can serve it.
+
+        Non-blocking: logs a warning on failure, never raises.
+        """
+        url = self.config.crm_upload_url
+        if not url:
+            return
+        token = self.config.crm_service_token or os.environ.get("MCP_SERVICE_TOKEN", "")
+        if not token:
+            return
+        admin_id = self._admin_id
+        try:
+            import httpx
+
+            endpoint = f"{url}/internal/set-transcript"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            if admin_id:
+                headers["X-Acting-As"] = admin_id
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(endpoint, json={"fileId": file_id, "text": text}, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning(
+                    "[crm-set-transcript] {} returned {}: {}", endpoint, resp.status_code, resp.text[:200]
+                )
+            else:
+                data = resp.json()
+                if data.get("skipped"):
+                    logger.debug("[crm-set-transcript] fileId={} already has a done transcript, skipped", file_id)
+                else:
+                    logger.info("[crm-set-transcript] stored transcript for fileId={}", file_id)
+        except Exception as e:
+            logger.warning("[crm-set-transcript] failed for fileId={}: {}", file_id, e)
 
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""
@@ -464,6 +498,7 @@ class WhatsAppChannel(BaseChannel):
                         tag = f"[音频文件转写] {transcription}"
                         if crm_result and crm_result.get("fileId"):
                             tag += f"\n[CRM文件已上传 fileId={crm_result['fileId']}]"
+                            await self._store_transcript_to_crm(crm_result["fileId"], transcription)
                         content = f"{content}\n{tag}" if content else tag
                         logger.info("Transcribed audio attachment: {}...", transcription[:50])
                         continue  # Don't add [file: /path] tag
