@@ -47,6 +47,9 @@ class WhatsAppConfig(Base):
     transcription_api_key: str = ""
     transcription_api_base: str = ""
     transcription_language: str | None = None
+    # Sent immediately when a PTT voice message is received, before the
+    # Groq/Whisper call begins (issue #387). Set to "" to disable.
+    transcription_ack: str = "正在转写语音消息，请稍候..."
     # CRM audio upload — upload inbound WhatsApp audio to CRM File storage
     # so the agent can use file.transcribe / file.get_transcript MCP tools.
     # Format: http://<host>:<port> (no trailing slash). Empty = disabled.
@@ -434,6 +437,18 @@ class WhatsAppChannel(BaseChannel):
                     # Skip CRM upload — the agent treats the transcribed text
                     # as typed input and reacts directly (see SOUL.md
                     # "WhatsApp voice messages — treat as typed input").
+
+                    # Issue #387: send immediate ack before the blocking
+                    # Groq/Whisper call so the user isn't left in silence.
+                    ack_text = self.config.transcription_ack
+                    if ack_text and self._ws and self._connected:
+                        try:
+                            await self._ws.send(
+                                json.dumps({"type": "send", "to": sender, "text": ack_text}, ensure_ascii=False)
+                            )
+                        except Exception as _ack_err:
+                            logger.warning("Failed to send transcription ack to {}: {}", sender_id, _ack_err)
+
                     logger.info("Transcribing voice message from {}...", sender_id)
                     transcription = await self.transcribe_audio(media_paths[0])
                     if transcription:
