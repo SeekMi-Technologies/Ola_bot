@@ -387,6 +387,8 @@ class WhatsAppChannel(BaseChannel):
 
         endpoint = f"{url}/internal/job/{job_id}"
         headers = {"Authorization": f"Bearer {token}"}
+        if self._admin_id:
+            headers["X-Acting-As"] = self._admin_id
         deadline = _time.monotonic() + max_wait
 
         import httpx
