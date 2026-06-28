@@ -55,6 +55,9 @@ class WhatsAppConfig(Base):
     # Format: http://<host>:<port> (no trailing slash). Empty = disabled.
     crm_upload_url: str = ""
     crm_service_token: str = ""  # Bearer token; defaults to MCP_SERVICE_TOKEN env
+    # Sent immediately when a non-PTT audio attachment arrives, before the
+    # upload + Paraformer transcription completes. Set to "" to disable.
+    audio_upload_ack: str = "正在处理音频，转写完成后我会自动回复..."
 
 
 def _bridge_token_path() -> Path:
@@ -364,6 +367,85 @@ class WhatsAppChannel(BaseChannel):
             logger.warning("[crm-upload] failed for {}: {}", file_path, e)
             return None
 
+    async def _poll_job_until_done(
+        self, job_id: str, max_wait: int = 600, poll_interval: float = 5.0
+    ) -> tuple[str, str | None]:
+        """Poll GET /internal/job/:id until status is done or failed.
+
+        Returns (status, error) where status is one of:
+          'done'    — transcription succeeded
+          'failed'  — transcription failed; error contains the reason
+          'timeout' — max_wait exceeded without reaching a terminal state
+        """
+        import asyncio
+        import time as _time
+
+        url = self.config.crm_upload_url
+        token = self.config.crm_service_token or os.environ.get("MCP_SERVICE_TOKEN", "")
+        if not url or not token:
+            return ("failed", "crm_upload_url or service token not configured")
+
+        endpoint = f"{url}/internal/job/{job_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        deadline = _time.monotonic() + max_wait
+
+        import httpx
+
+        while _time.monotonic() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(endpoint, headers=headers)
+                if resp.status_code == 404:
+                    return ("failed", "Job not found")
+                if resp.status_code >= 400:
+                    logger.warning("[crm-poll] {} → HTTP {}", endpoint, resp.status_code)
+                    await asyncio.sleep(poll_interval)
+                    continue
+                data = resp.json()
+                status = data.get("status", "")
+                if status == "done":
+                    return ("done", None)
+                if status == "failed":
+                    return ("failed", data.get("error") or "transcription failed")
+                # pending / running — keep polling
+                await asyncio.sleep(poll_interval)
+            except Exception as exc:
+                logger.warning("[crm-poll] error polling job {}: {}", job_id, exc)
+                await asyncio.sleep(poll_interval)
+
+        return ("timeout", None)
+
+    async def _fetch_transcript(self, file_id: str, admin_id: str) -> str | None:
+        """Fetch the completed transcript text from CRM internal API.
+
+        Returns the transcript string on success, or None if unavailable.
+        Non-raising: any failure is logged and returns None so the caller
+        can fall back gracefully.
+        """
+        url = self.config.crm_upload_url
+        token = self.config.crm_service_token or os.environ.get("MCP_SERVICE_TOKEN", "")
+        if not url or not token:
+            return None
+
+        endpoint = f"{url}/internal/file/{file_id}/transcript"
+        headers = {"Authorization": f"Bearer {token}"}
+        if admin_id:
+            headers["X-Acting-As"] = admin_id
+
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(endpoint, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("[crm-transcript] {} → HTTP {}", endpoint, resp.status_code)
+                return None
+            data = resp.json()
+            return data.get("transcript") or None
+        except Exception as exc:
+            logger.warning("[crm-transcript] error fetching transcript for {}: {}", file_id, exc)
+            return None
+
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""
         try:
@@ -469,14 +551,78 @@ class WhatsAppChannel(BaseChannel):
                     continue
                 mime, _ = mimetypes.guess_type(p)
 
-                # Upload audio document attachments to CRM for paraformer transcription.
-                # Agent retrieves the transcript via file.get_transcript MCP tool when ready.
+                # Upload audio document attachments to CRM and wait for Paraformer
+                # transcription to finish before handing off to the agent.
+                # This mirrors AskOla.jsx _pollUntilDone: the channel layer owns
+                # the wait so the agent always receives a ready transcript.
                 if mime and mime.startswith("audio/"):
+                    # Ack immediately — Paraformer can take up to several minutes
+                    ack_text = self.config.audio_upload_ack
+                    if ack_text and self._ws and self._connected:
+                        try:
+                            await self._ws.send(
+                                json.dumps(
+                                    {"type": "send", "to": sender, "text": ack_text},
+                                    ensure_ascii=False,
+                                )
+                            )
+                        except Exception as _ack_err:
+                            logger.warning(
+                                "Failed to send audio upload ack to {}: {}", sender_id, _ack_err
+                            )
+
                     crm_result = await self._upload_audio_to_crm(p)
                     if crm_result and crm_result.get("fileId"):
-                        tag = f"[音频文件已上传 fileId={crm_result['fileId']}，CRM 正在转写，可用 file.get_transcript 查询结果]"
-                        content = f"{content}\n{tag}" if content else tag
-                        logger.info("Audio attachment uploaded to CRM fileId={}", crm_result["fileId"])
+                        file_id = crm_result["fileId"]
+                        job_id = crm_result.get("transcriptionJobId")
+                        deduped = crm_result.get("deduped", False)
+
+                        if job_id and not deduped:
+                            logger.info(
+                                "[crm-poll] waiting for transcription job={} file={}",
+                                job_id, file_id,
+                            )
+                            poll_status, poll_err = await self._poll_job_until_done(job_id)
+                            logger.info(
+                                "[crm-poll] job={} finished with status={}", job_id, poll_status
+                            )
+                        else:
+                            # Deduped — file was already transcribed in a prior upload
+                            poll_status, poll_err = "done", None
+
+                        if poll_status == "done":
+                            transcript_text = await self._fetch_transcript(file_id, admin_id)
+                            if transcript_text:
+                                # Inline transcript exactly like a PTT voice note —
+                                # agent applies the sugar (2–4 sentence summary) with
+                                # no tool call needed. See SOUL.md §WhatsApp voice.
+                                inline = f"[音频文件转写] {transcript_text}"
+                                content = f"{content}\n{inline}" if content else inline
+                                logger.info(
+                                    "Audio transcript inlined fileId={} ({} chars)",
+                                    file_id, len(transcript_text),
+                                )
+                            else:
+                                # Transcript unavailable despite done status — rare;
+                                # tell agent to inform the user gracefully.
+                                note = "[音频转写读取失败，请告知用户转写暂不可用，建议稍后在 Ola 文件页面查看]"
+                                content = f"{content}\n{note}" if content else note
+                                logger.warning(
+                                    "Audio job done but transcript fetch failed fileId={}", file_id
+                                )
+                        elif poll_status == "failed":
+                            note = (
+                                f"[音频转写失败：{poll_err or '未知错误'}，"
+                                f"请告知用户转写失败，建议重新上传或改用文字输入]"
+                            )
+                            content = f"{content}\n{note}" if content else note
+                        else:  # timeout
+                            note = "[音频转写超时，请告知用户转写仍在进行，稍后在 Ola 文件页面查看结果]"
+                            content = f"{content}\n{note}" if content else note
+
+                        logger.info(
+                            "Audio attachment processed fileId={} status={}", file_id, poll_status
+                        )
                         continue  # Don't add [file: /path] tag
                     # Upload failed — fall through to regular file tag
 
