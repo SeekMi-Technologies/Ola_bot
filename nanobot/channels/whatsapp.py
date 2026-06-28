@@ -593,7 +593,7 @@ class WhatsAppChannel(BaseChannel):
                             poll_status, poll_err = "done", None
 
                         if poll_status == "done":
-                            transcript_text = await self._fetch_transcript(file_id, admin_id)
+                            transcript_text = await self._fetch_transcript(file_id, self._admin_id)
                             if transcript_text:
                                 # Inline transcript exactly like a PTT voice note —
                                 # agent applies the sugar (2–4 sentence summary) with
