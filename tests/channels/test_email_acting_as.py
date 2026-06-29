@@ -315,7 +315,7 @@ async def test_concurrent_inbound_each_carries_own_acting_as(mcp_token):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_propagates_acting_as_to_contextvar():
+async def test_dispatch_propagates_acting_as_to_contextvar(tmp_path):
     """agent.loop._dispatch must call set_acting_as with metadata['_acting_as']."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
@@ -339,6 +339,7 @@ async def test_dispatch_propagates_acting_as_to_contextvar():
         # first line (set_acting_as call) to fire. Force _effective_session_key
         # to raise so we exit early after _connect_mcp early-returns.
         loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_path  # _dispatch provisions the acting admin (#354)
         loop._mcp_connected = True  # Skip _connect_mcp work
         loop._mcp_connecting = False
         loop._mcp_servers = {}

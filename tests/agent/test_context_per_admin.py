@@ -81,3 +81,72 @@ def test_memory_md_per_admin_in_prompt(workspace):
 
     assert "Apex Industrial" in a_prompt
     assert "Apex Industrial" not in b_prompt
+
+
+# -- #353: SOUL.md / TOOLS.md per-admin override with global fallback ----------
+
+
+def test_soul_per_admin_override_with_global_fallback(workspace):
+    (workspace / "SOUL.md").write_text("# Soul\nGlobal doctrine.", encoding="utf-8")
+    (workspace / "admins" / "admin-A").mkdir(parents=True)
+    (workspace / "admins" / "admin-A" / "SOUL.md").write_text(
+        "# Soul\nA's custom doctrine.", encoding="utf-8"
+    )
+
+    builder = ContextBuilder(workspace)
+    with with_acting_admin_id("admin-A"):
+        prompt_a = builder.build_system_prompt()
+    with with_acting_admin_id("admin-B"):
+        prompt_b = builder.build_system_prompt()
+
+    assert "A's custom doctrine" in prompt_a and "Global doctrine" not in prompt_a
+    assert "Global doctrine" in prompt_b and "A's custom doctrine" not in prompt_b
+
+
+def test_global_tools_edit_reaches_non_overridden_admins(workspace):
+    # No per-admin TOOLS.md exists: editing the global file must reach an admin
+    # immediately on the next read (read-time resolution, no per-admin copies).
+    tools = workspace / "TOOLS.md"
+    tools.write_text("# Tools\nv1 global tools.", encoding="utf-8")
+
+    builder = ContextBuilder(workspace)
+    with with_acting_admin_id("admin-A"):
+        assert "v1 global tools" in builder.build_system_prompt()
+
+    tools.write_text("# Tools\nv2 global tools.", encoding="utf-8")
+    with with_acting_admin_id("admin-A"):
+        assert "v2 global tools" in builder.build_system_prompt()
+
+
+def test_agents_md_is_always_global_never_overridden(workspace):
+    (workspace / "AGENTS.md").write_text(
+        "# Agents\nGlobal security layer.", encoding="utf-8"
+    )
+    (workspace / "admins" / "admin-A").mkdir(parents=True)
+    (workspace / "admins" / "admin-A" / "AGENTS.md").write_text(
+        "# Agents\nInjected per-admin override.", encoding="utf-8"
+    )
+
+    builder = ContextBuilder(workspace)
+    with with_acting_admin_id("admin-A"):
+        prompt = builder.build_system_prompt()
+
+    assert "Global security layer" in prompt
+    assert "Injected per-admin override" not in prompt
+
+
+def test_bootstrap_identical_across_admins_when_no_overrides(workspace):
+    # Zero per-admin override files → the bootstrap section is byte-identical for
+    # every admin (no behavior change vs the pre-#353 global-only read path).
+    (workspace / "AGENTS.md").write_text("# Agents\nG-A.", encoding="utf-8")
+    (workspace / "SOUL.md").write_text("# Soul\nG-S.", encoding="utf-8")
+    (workspace / "TOOLS.md").write_text("# Tools\nG-T.", encoding="utf-8")
+
+    builder = ContextBuilder(workspace)
+    with with_acting_admin_id("admin-A"):
+        boot_a = builder._load_bootstrap_files()
+    with with_acting_admin_id("admin-B"):
+        boot_b = builder._load_bootstrap_files()
+
+    assert boot_a == boot_b
+    assert "G-A" in boot_a and "G-S" in boot_a and "G-T" in boot_a
