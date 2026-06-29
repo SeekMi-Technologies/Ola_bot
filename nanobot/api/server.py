@@ -235,7 +235,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     # X-Acting-As baked into the httpx client headers. Header absent → stays
     # None → backend falls back to systemAdmin.
     set_acting_as(request.headers.get("X-Ola-Acting-As"))
-    provision_admin(request.app["agent_loop"].workspace, get_acting_admin_id())
+    await asyncio.to_thread(provision_admin, request.app["agent_loop"].workspace, get_acting_admin_id())
 
     content_type = request.content_type or ""
     if not isinstance(content_type, str):

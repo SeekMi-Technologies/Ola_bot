@@ -686,7 +686,7 @@ class AgentLoop:
         # propagate across the bus queue, so channels carry it via metadata.
         _acting = (msg.metadata or {}).get("_acting_as")
         set_acting_as(_acting)
-        provision_admin(self.workspace, get_acting_admin_id())
+        await asyncio.to_thread(provision_admin, self.workspace, get_acting_admin_id())
 
         # Mirror process_direct: retry MCP connection on every message so a
         # startup race (port-up before protocol-ready) does not leave bus

@@ -75,7 +75,10 @@ class MemoryStore:
 
     @property
     def soul_file(self) -> Path:
-        # Global, per-tenant. Stays at workspace root until multi-customer.
+        # Global only. TODO(persona-API): when a per-admin SOUL.md override can
+        # exist, Dream/consolidation must read via resolve_overridable_file too,
+        # else it consolidates against the wrong soul while the prompt builder
+        # uses the override.
         return self.workspace / "SOUL.md"
 
     def resolve_overridable_file(self, filename: str) -> Path:

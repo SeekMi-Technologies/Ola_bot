@@ -527,7 +527,6 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
             tracked_files=[
                 "SOUL.md",
                 "USER.md",
-                "memory/MEMORY.md",
             ],
         )
         gs.init()
@@ -573,7 +572,10 @@ def provision_admin(workspace: Path, admin_id: str | None) -> bool:
         if root_template.exists():
             _write_text_atomic(dest, root_template.read_text(encoding="utf-8"))
         else:
-            logger.warning("provision_admin: workspace-root {} missing; skipped seeding it for {}", filename, admin_id)
+            logger.warning(
+                "provision_admin: workspace-root {} missing; skipped seeding it for {}",
+                filename, admin_id,
+            )
 
     for empty_file in (admin_dir / "memory" / "MEMORY.md", admin_dir / "memory" / "history.jsonl"):
         if not empty_file.exists():
