@@ -34,8 +34,11 @@ services:
   nanobot-api:
     container_name: nanobot-api
     <<: *common-config
-    command:
-      ["serve", "--host", "0.0.0.0", "--port", "8900", "-w", "/home/nanobot/.nanobot/api-workspace"]
+    # Shares the default workspace (~/.nanobot/workspace) with nanobot-gateway:
+    # one persona/config source + one per-admin memory store across channels.
+    # Dropped the former `-w api-workspace` split (WS-D interim) — see Ola
+    # doc/nanobot_multitenancy_redesign.md §9.
+    command: ["serve", "--host", "0.0.0.0", "--port", "8900"]
     restart: unless-stopped
     ports:
       - "${NANOBOT_BIND_ADDR:-127.0.0.1}:8900:8900"
