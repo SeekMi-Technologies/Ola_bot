@@ -28,8 +28,8 @@ def test_new_admin_fully_provisioned(workspace):
     assert provision_admin(workspace, "admin-A") is True
     d = _admin_dir(workspace, "admin-A")
     assert (d / "USER.md").exists()
-    assert (d / "SOUL.md").exists()
-    assert (d / "TOOLS.md").exists()
+    assert not (d / "SOUL.md").exists()  # resolves to global at read time, not copied
+    assert not (d / "TOOLS.md").exists()
     assert not (d / "AGENTS.md").exists()  # global security layer, never per-admin
     assert (d / "memory" / "MEMORY.md").exists()
     assert (d / "memory" / "history.jsonl").exists()
@@ -37,11 +37,14 @@ def test_new_admin_fully_provisioned(workspace):
     assert (d / ".provisioned").exists()
 
 
-def test_persona_files_seeded_from_root_templates(workspace):
+def test_user_seeded_soul_tools_not_copied(workspace):
     provision_admin(workspace, "admin-A")
     d = _admin_dir(workspace, "admin-A")
-    for filename in ("USER.md", "SOUL.md", "TOOLS.md"):
-        assert (d / filename).read_text(encoding="utf-8") == (workspace / filename).read_text(encoding="utf-8")
+    assert (d / "USER.md").read_text(encoding="utf-8") == (workspace / "USER.md").read_text(encoding="utf-8")
+    # SOUL/TOOLS are never copied — they fall back to the global file at read time,
+    # so global template updates keep reaching non-overridden admins.
+    assert not (d / "SOUL.md").exists()
+    assert not (d / "TOOLS.md").exists()
 
 
 def test_idempotent_second_call_no_writes(workspace):
@@ -49,8 +52,6 @@ def test_idempotent_second_call_no_writes(workspace):
     d = _admin_dir(workspace, "admin-A")
     files = [
         d / "USER.md",
-        d / "SOUL.md",
-        d / "TOOLS.md",
         d / "memory" / "MEMORY.md",
         d / "memory" / "history.jsonl",
         d / ".provisioned",
@@ -76,11 +77,11 @@ def test_existing_file_never_overwritten(workspace):
 
 
 def test_missing_root_template_is_skipped(workspace):
-    (workspace / "SOUL.md").unlink()  # no root SOUL template to seed from
+    (workspace / "USER.md").unlink()  # no root USER template to seed from
     assert provision_admin(workspace, "admin-A") is True
     d = _admin_dir(workspace, "admin-A")
-    assert not (d / "SOUL.md").exists()  # skipped, not created empty
-    assert (d / "USER.md").exists()  # others still seeded
+    assert not (d / "USER.md").exists()  # skipped, not created empty
+    assert (d / "memory" / "MEMORY.md").exists()  # skeleton still provisioned
     assert (d / ".provisioned").exists()
 
 
