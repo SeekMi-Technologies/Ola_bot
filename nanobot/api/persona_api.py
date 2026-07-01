@@ -74,10 +74,12 @@ async def handle_list(request: web.Request) -> web.Response:
             if not d.is_dir() or not _valid_admin(d.name):
                 continue
             soul = d / "SOUL.md"
+            user = d / "USER.md"
             admins.append(
                 {
                     "adminId": d.name,
                     "soulSource": "override" if soul.exists() else "global",
+                    "userSource": "override" if user.exists() else "global",
                     "updatedAt": soul.stat().st_mtime if soul.exists() else None,
                 }
             )

@@ -68,7 +68,9 @@ async def test_list_admins_skips_system_and_reports_soul_source(client):
     admins = {a["adminId"]: a for a in (await r.json())["admins"]}
     assert set(admins) == {"admin-A", "admin-B"}  # _system excluded
     assert admins["admin-A"]["soulSource"] == "override"
+    assert admins["admin-A"]["userSource"] == "override"  # fixture gave A a USER.md
     assert admins["admin-B"]["soulSource"] == "global"
+    assert admins["admin-B"]["userSource"] == "global"
 
 
 @pytest.mark.asyncio
