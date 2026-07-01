@@ -116,6 +116,15 @@ async def test_put_soul_writes_per_admin_override(client, workspace):
 
 
 @pytest.mark.asyncio
+async def test_padded_adminid_normalized(client, workspace):
+    # A whitespace-padded id must resolve to the canonical dir, not a duplicate.
+    r = await client.put("/internal/persona/admin-B%20/SOUL.md", headers=AUTH, json={"content": "X"})
+    assert r.status == 200
+    assert (workspace / "admins" / "admin-B" / "SOUL.md").read_text(encoding="utf-8") == "X"
+    assert not (workspace / "admins" / "admin-B ").exists()
+
+
+@pytest.mark.asyncio
 async def test_put_agents_forbidden(client):
     r = await client.put(
         "/internal/persona/admin-A/AGENTS.md", headers=AUTH, json={"content": "hack"}

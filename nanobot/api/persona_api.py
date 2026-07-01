@@ -28,6 +28,7 @@ rejected.
 
 from __future__ import annotations
 
+import hmac
 import os
 from pathlib import Path
 
@@ -67,7 +68,8 @@ def _authorized(request: web.Request) -> bool:
     expected = _expected_token(request.app)
     if not expected:
         return False
-    return request.headers.get("Authorization", "") == f"Bearer {expected}"
+    got = request.headers.get("Authorization", "")
+    return hmac.compare_digest(got.encode(), f"Bearer {expected}".encode())
 
 
 def _resolve(workspace: Path, admin_id: str, filename: str) -> tuple[Path, str]:
@@ -133,7 +135,7 @@ async def handle_get(request: web.Request) -> web.Response:
     if not _authorized(request):
         return _unauthorized()
     workspace = _workspace(request)
-    admin_id = request.match_info["adminId"]
+    admin_id = request.match_info["adminId"].strip()
     if not _valid_admin(admin_id):
         return web.json_response({"error": "invalid adminId"}, status=400)
 
@@ -151,7 +153,7 @@ async def handle_put(request: web.Request) -> web.Response:
     if not _authorized(request):
         return _unauthorized()
     workspace = _workspace(request)
-    admin_id = request.match_info["adminId"]
+    admin_id = request.match_info["adminId"].strip()
     filename = request.match_info["file"]
     if not _valid_admin(admin_id):
         return web.json_response({"error": "invalid adminId"}, status=400)
@@ -162,7 +164,8 @@ async def handle_put(request: web.Request) -> web.Response:
         )
     try:
         body = await request.json()
-    except Exception:
+    except Exception as e:
+        logger.debug("persona PUT bad JSON body from {}: {}", admin_id, e)
         return web.json_response({"error": "invalid JSON body"}, status=400)
     content = body.get("content")
     if not isinstance(content, str):
@@ -174,8 +177,10 @@ async def handle_put(request: web.Request) -> web.Response:
     _write_text_atomic(dest, content)
     try:
         os.chown(dest, 1000, 1000)
-    except (PermissionError, OSError):
-        pass  # dev machines run as the invoking user; container runs as uid 1000
+    except (PermissionError, OSError) as e:
+        # Expected on dev machines (invoking user owns it); container runs as uid
+        # 1000 so chown is a no-op there. Log in case it's an unexpected prod uid.
+        logger.debug("persona PUT chown 1000:1000 skipped for {}: {}", dest, e)
     logger.info("persona PUT admin={} file={} bytes={}", admin_id, filename, len(content))
     return web.json_response(
         {"adminId": admin_id, "file": filename, "bytes": len(content), "source": "override"}
