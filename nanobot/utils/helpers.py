@@ -536,19 +536,22 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     return added
 
 
-# Only USER.md is seeded. SOUL/TOOLS resolve at read-time with global fallback
-# (resolve_overridable_file) — copying them would freeze a stale snapshot and
-# stop template updates reaching existing admins. AGENTS.md is never per-admin.
-_PER_ADMIN_SEED_FILES = ("USER.md",)
+# Seeded per-admin from the workspace-root template: SOUL.md (persona) and
+# USER.md (profile) — both are per-company templates each tenant fills in, and
+# become the editable per-user files (devboard persona control-plane). TOOLS.md
+# is NOT seeded (shared operational guidance — stays global, propagates on deploy)
+# and AGENTS.md is never per-admin (authority/security layer). The read-time
+# resolver still falls back to global for any file a tenant doesn't have yet.
+_PER_ADMIN_SEED_FILES = ("USER.md", "SOUL.md")
 
 
 def provision_admin(workspace: Path, admin_id: str | None) -> bool:
     """Lazily create a per-admin workspace skeleton. Idempotent and never
     overwrites; returns True only if it created something.
 
-    Seeds USER.md from the workspace-root template. SOUL.md / TOOLS.md are not
-    copied — they fall back to the global file at read time; AGENTS.md stays
-    global too. MEMORY.md / history.jsonl start empty. _system, None, and
+    Seeds SOUL.md + USER.md from the workspace-root templates (per-company,
+    editable per tenant). TOOLS.md is not copied (stays global) and AGENTS.md is
+    never per-admin. MEMORY.md / history.jsonl start empty. _system, None, and
     path-traversal-unsafe ids are no-ops (no dir created).
     """
     from nanobot.agent.admin_context import SYSTEM_ADMIN_ID, is_valid_admin_id
