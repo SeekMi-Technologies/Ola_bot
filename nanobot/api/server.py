@@ -500,4 +500,10 @@ def create_app(
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+
+    # Persona control-plane (devboard) — rides serve's already-Tailscale-exposed
+    # port; token-gated per handler, so chat/health stay unauthenticated as before.
+    from nanobot.api.persona_api import add_persona_routes
+
+    add_persona_routes(app, agent_loop.workspace)
     return app

@@ -1,19 +1,29 @@
-"""Internal persona control-plane API.
+"""Internal persona control-plane routes.
 
-A small, Tailscale-only HTTP service that lets the Ola devboard read and edit a
-tenant's per-admin prompt files without anyone touching the box filesystem
-directly. nanobot stays the sole owner of its workspace; callers only ask it to
-change its own files.
+Lets the Ola devboard read and edit a tenant's per-admin prompt files without
+touching the box filesystem directly — nanobot stays the sole owner of its
+workspace; callers only ask it to change its own files.
+
+These routes mount onto the existing ``serve`` app (so they need NO new
+container / compose service / CD change — they ride the serve port that is
+already exposed on Tailscale). ``create_persona_app`` also exposes them as a
+standalone app for local dev / a dedicated process if ever wanted.
 
 Surface (all except /health require ``Authorization: Bearer <token>``):
-  GET  /internal/persona                     -> list admin ids + SOUL source
+  GET  /internal/persona                     -> list admin ids + SOUL/USER source
   GET  /internal/persona/{adminId}           -> effective SOUL/USER (editable) +
                                                 AGENTS/TOOLS (read-only), with source
   PUT  /internal/persona/{adminId}/{file}    -> write per-admin SOUL.md | USER.md
 
-Boundaries: only SOUL.md and USER.md are writable per-admin. AGENTS.md (authority
-layer) and TOOLS.md (shared operational guidance) are read-only here and never
-written per-admin. adminId is path-traversal validated; _system is rejected.
+Token resolution (per request, so it is configurable without a restart):
+  1. app["persona_token_override"] (standalone --token), else
+  2. env PERSONA_API_TOKEN, else
+  3. <state-dir>/.persona_token  (workspace.parent/.persona_token) — the file an
+     operator drops on the box; different per box, no CD needed.
+
+Boundaries: only SOUL.md/USER.md writable per-admin. AGENTS.md (authority) and
+TOOLS.md (shared) are read-only. adminId is path-traversal validated; _system
+rejected.
 """
 
 from __future__ import annotations
@@ -33,8 +43,32 @@ EDITABLE_FILES = ("SOUL.md", "USER.md")
 READONLY_FILES = ("AGENTS.md", "TOOLS.md")
 
 
+def _workspace(request: web.Request) -> Path:
+    return request.app["persona_workspace"]
+
+
+def _expected_token(app: web.Application) -> str | None:
+    override = app.get("persona_token_override")
+    if override:
+        return override
+    env = os.environ.get("PERSONA_API_TOKEN")
+    if env:
+        return env
+    token_file = app["persona_workspace"].parent / ".persona_token"
+    if token_file.exists():
+        return token_file.read_text(encoding="utf-8").strip() or None
+    return None
+
+
+def _authorized(request: web.Request) -> bool:
+    expected = _expected_token(request.app)
+    if not expected:
+        return False
+    return request.headers.get("Authorization", "") == f"Bearer {expected}"
+
+
 def _resolve(workspace: Path, admin_id: str, filename: str) -> tuple[Path, str]:
-    """Return (path, source): the per-admin override if it exists, else global root."""
+    """Return (path, source): per-admin override if it exists, else global root."""
     per_admin = workspace / "admins" / admin_id / filename
     if per_admin.exists():
         return per_admin, "override"
@@ -45,20 +79,12 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-@web.middleware
-async def _auth_middleware(request: web.Request, handler):
-    if request.path == "/health":
-        return await handler(request)
-    expected = request.app["token"]
-    if not expected:
-        return web.json_response({"error": "persona API token not configured"}, status=503)
-    if request.headers.get("Authorization", "") != f"Bearer {expected}":
-        return web.json_response({"error": "unauthorized"}, status=401)
-    return await handler(request)
-
-
 def _valid_admin(admin_id: str) -> bool:
     return is_valid_admin_id(admin_id) and admin_id != SYSTEM_ADMIN_ID
+
+
+def _unauthorized() -> web.Response:
+    return web.json_response({"error": "unauthorized"}, status=401)
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -66,8 +92,9 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_list(request: web.Request) -> web.Response:
-    workspace: Path = request.app["workspace"]
-    admins_dir = workspace / "admins"
+    if not _authorized(request):
+        return _unauthorized()
+    admins_dir = _workspace(request) / "admins"
     admins = []
     if admins_dir.is_dir():
         for d in sorted(admins_dir.iterdir()):
@@ -87,7 +114,9 @@ async def handle_list(request: web.Request) -> web.Response:
 
 
 async def handle_get(request: web.Request) -> web.Response:
-    workspace: Path = request.app["workspace"]
+    if not _authorized(request):
+        return _unauthorized()
+    workspace = _workspace(request)
     admin_id = request.match_info["adminId"]
     if not _valid_admin(admin_id):
         return web.json_response({"error": "invalid adminId"}, status=400)
@@ -103,7 +132,9 @@ async def handle_get(request: web.Request) -> web.Response:
 
 
 async def handle_put(request: web.Request) -> web.Response:
-    workspace: Path = request.app["workspace"]
+    if not _authorized(request):
+        return _unauthorized()
+    workspace = _workspace(request)
     admin_id = request.match_info["adminId"]
     filename = request.match_info["file"]
     if not _valid_admin(admin_id):
@@ -135,13 +166,23 @@ async def handle_put(request: web.Request) -> web.Response:
     )
 
 
-def create_persona_app(workspace: Path, token: str | None) -> web.Application:
-    """Build the persona control-plane aiohttp app."""
-    app = web.Application(middlewares=[_auth_middleware])
-    app["workspace"] = workspace
-    app["token"] = token
-    app.router.add_get("/health", handle_health)
+def add_persona_routes(app: web.Application, workspace: Path) -> None:
+    """Mount the persona routes onto an existing app (e.g. the serve app).
+
+    Adds no global middleware — each handler checks the bearer token itself, so
+    the host app's other routes (chat, health) are untouched.
+    """
+    app["persona_workspace"] = workspace
     app.router.add_get("/internal/persona", handle_list)
     app.router.add_get("/internal/persona/{adminId}", handle_get)
     app.router.add_put("/internal/persona/{adminId}/{file}", handle_put)
+
+
+def create_persona_app(workspace: Path, token: str | None = None) -> web.Application:
+    """Standalone persona app (local dev / dedicated process)."""
+    app = web.Application()
+    if token:
+        app["persona_token_override"] = token
+    app.router.add_get("/health", handle_health)
+    add_persona_routes(app, workspace)
     return app

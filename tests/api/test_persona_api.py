@@ -128,3 +128,43 @@ async def test_system_and_traversal_ids_rejected(client):
 async def test_put_requires_string_content(client):
     r = await client.put("/internal/persona/admin-A/SOUL.md", headers=AUTH, json={"content": 123})
     assert r.status == 400
+
+
+async def _client_for(app):
+    c = TestClient(TestServer(app))
+    await c.start_server()
+    return c
+
+
+@pytest.mark.asyncio
+async def test_token_from_state_dir_file(workspace):
+    # Operator drops <state-dir>/.persona_token (workspace.parent) — no env/CD.
+    (workspace.parent / ".persona_token").write_text("filetoken\n", encoding="utf-8")
+    c = await _client_for(create_persona_app(workspace))  # no override, no env
+    try:
+        assert (await c.get("/internal/persona")).status == 401  # no header
+        ok = await c.get("/internal/persona", headers={"Authorization": "Bearer filetoken"})
+        assert ok.status == 200
+    finally:
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_token_from_env(workspace, monkeypatch):
+    monkeypatch.setenv("PERSONA_API_TOKEN", "envtoken")
+    c = await _client_for(create_persona_app(workspace))
+    try:
+        r = await c.get("/internal/persona", headers={"Authorization": "Bearer envtoken"})
+        assert r.status == 200
+    finally:
+        await c.close()
+
+
+@pytest.mark.asyncio
+async def test_no_token_configured_rejects_everything(workspace):
+    c = await _client_for(create_persona_app(workspace))  # no override/env/file
+    try:
+        r = await c.get("/internal/persona", headers={"Authorization": "Bearer anything"})
+        assert r.status == 401
+    finally:
+        await c.close()
