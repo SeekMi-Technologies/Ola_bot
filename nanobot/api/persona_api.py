@@ -41,6 +41,9 @@ from nanobot.utils.helpers import _write_text_atomic
 EDITABLE_FILES = ("SOUL.md", "USER.md")
 # Effective content exposed read-only (AGENTS = authority layer; TOOLS = shared).
 READONLY_FILES = ("AGENTS.md", "TOOLS.md")
+# Global-root files, exposed read-only (edited via the repo template + deploy,
+# never on the box — the provisioner overwrites them every deploy).
+GLOBAL_FILES = ("SOUL.md", "AGENTS.md", "TOOLS.md")
 
 
 def _workspace(request: web.Request) -> Path:
@@ -113,6 +116,19 @@ async def handle_list(request: web.Request) -> web.Response:
     return web.json_response({"admins": admins})
 
 
+async def handle_global(request: web.Request) -> web.Response:
+    """Read-only view of the global-root SOUL/AGENTS/TOOLS. Editing these is a
+    repo + deploy concern (the box copies are overwritten each deploy)."""
+    if not _authorized(request):
+        return _unauthorized()
+    workspace = _workspace(request)
+    files = {
+        name: {"content": _read(workspace / name), "source": "global", "editable": False}
+        for name in GLOBAL_FILES
+    }
+    return web.json_response({"files": files})
+
+
 async def handle_get(request: web.Request) -> web.Response:
     if not _authorized(request):
         return _unauthorized()
@@ -174,6 +190,7 @@ def add_persona_routes(app: web.Application, workspace: Path) -> None:
     """
     app["persona_workspace"] = workspace
     app.router.add_get("/internal/persona", handle_list)
+    app.router.add_get("/internal/global", handle_global)
     app.router.add_get("/internal/persona/{adminId}", handle_get)
     app.router.add_put("/internal/persona/{adminId}/{file}", handle_put)
 

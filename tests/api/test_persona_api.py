@@ -74,6 +74,21 @@ async def test_list_admins_skips_system_and_reports_soul_source(client):
 
 
 @pytest.mark.asyncio
+async def test_global_view_is_readonly_root_files(client):
+    r = await client.get("/internal/global", headers=AUTH)
+    assert r.status == 200
+    files = (await r.json())["files"]
+    assert set(files) == {"SOUL.md", "AGENTS.md", "TOOLS.md"}
+    assert files["SOUL.md"]["content"] == "GLOBAL SOUL\n"
+    assert all(f["editable"] is False and f["source"] == "global" for f in files.values())
+
+
+@pytest.mark.asyncio
+async def test_global_requires_auth(client):
+    assert (await client.get("/internal/global")).status == 401
+
+
+@pytest.mark.asyncio
 async def test_get_returns_override_and_global_sources(client):
     r = await client.get("/internal/persona/admin-A", headers=AUTH)
     files = (await r.json())["files"]
