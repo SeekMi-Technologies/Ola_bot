@@ -28,8 +28,8 @@ def test_new_admin_fully_provisioned(workspace):
     assert provision_admin(workspace, "admin-A") is True
     d = _admin_dir(workspace, "admin-A")
     assert (d / "USER.md").exists()
-    assert not (d / "SOUL.md").exists()  # resolves to global at read time, not copied
-    assert not (d / "TOOLS.md").exists()
+    assert (d / "SOUL.md").exists()  # persona template, seeded + editable per tenant
+    assert not (d / "TOOLS.md").exists()  # shared operational guidance, stays global
     assert not (d / "AGENTS.md").exists()  # global security layer, never per-admin
     assert (d / "memory" / "MEMORY.md").exists()
     assert (d / "memory" / "history.jsonl").exists()
@@ -37,14 +37,15 @@ def test_new_admin_fully_provisioned(workspace):
     assert (d / ".provisioned").exists()
 
 
-def test_user_seeded_soul_tools_not_copied(workspace):
+def test_soul_and_user_seeded_tools_not_copied(workspace):
     provision_admin(workspace, "admin-A")
     d = _admin_dir(workspace, "admin-A")
+    # SOUL + USER seeded verbatim from the workspace-root templates.
     assert (d / "USER.md").read_text(encoding="utf-8") == (workspace / "USER.md").read_text(encoding="utf-8")
-    # SOUL/TOOLS are never copied — they fall back to the global file at read time,
-    # so global template updates keep reaching non-overridden admins.
-    assert not (d / "SOUL.md").exists()
+    assert (d / "SOUL.md").read_text(encoding="utf-8") == (workspace / "SOUL.md").read_text(encoding="utf-8")
+    # TOOLS stays global (falls back at read time); AGENTS never per-admin.
     assert not (d / "TOOLS.md").exists()
+    assert not (d / "AGENTS.md").exists()
 
 
 def test_idempotent_second_call_no_writes(workspace):
@@ -52,6 +53,7 @@ def test_idempotent_second_call_no_writes(workspace):
     d = _admin_dir(workspace, "admin-A")
     files = [
         d / "USER.md",
+        d / "SOUL.md",
         d / "memory" / "MEMORY.md",
         d / "memory" / "history.jsonl",
         d / ".provisioned",
