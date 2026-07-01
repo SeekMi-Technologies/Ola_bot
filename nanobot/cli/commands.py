@@ -627,6 +627,57 @@ def serve(
     web.run_app(api_app, host=host, port=port, print=lambda msg: logger.info(msg))
 
 
+@app.command(name="persona-api")
+def persona_api(
+    port: int = typer.Option(8902, "--port", "-p", help="Persona API port"),
+    host: str = typer.Option("127.0.0.1", "--host", "-H", help="Bind address (Tailscale IP in prod)"),
+    token: str | None = typer.Option(None, "--token", help="Bearer token (else PERSONA_API_TOKEN env)"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show runtime logs"),
+):
+    """Start the internal persona control-plane API (/internal/persona/*).
+
+    Devboard-only, Tailscale-bound, bearer-token auth. Reads/writes per-admin
+    SOUL.md / USER.md in this process's workspace.
+    """
+    try:
+        from aiohttp import web  # noqa: F401
+    except ImportError:
+        console.print("[red]aiohttp is required. Install with: pip install 'nanobot-ai[api]'[/red]")
+        raise typer.Exit(1)
+
+    import os as _os
+
+    from loguru import logger
+    from nanobot.api.persona_api import create_persona_app
+
+    if verbose:
+        logger.enable("nanobot")
+    else:
+        logger.disable("nanobot")
+
+    token = token or _os.environ.get("PERSONA_API_TOKEN")
+    if not token:
+        console.print("[red]No token: pass --token or set PERSONA_API_TOKEN.[/red]")
+        raise typer.Exit(1)
+
+    runtime_config = _load_runtime_config(config, workspace)
+    sync_workspace_templates(runtime_config.workspace_path)
+
+    console.print(f"{__logo__} Starting persona control-plane API")
+    console.print(f"  [cyan]Endpoint[/cyan] : http://{host}:{port}/internal/persona")
+    console.print(f"  [cyan]Workspace[/cyan]: {runtime_config.workspace_path}")
+    if host in {"0.0.0.0", "::"}:
+        console.print(
+            "[yellow]Warning:[/yellow] bound to all interfaces — only behind Tailscale/firewall."
+        )
+    console.print()
+
+    app_ = create_persona_app(runtime_config.workspace_path, token)
+    web.run_app(app_, host=host, port=port, print=lambda msg: logger.info(msg))
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
