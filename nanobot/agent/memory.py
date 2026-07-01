@@ -75,10 +75,17 @@ class MemoryStore:
 
     @property
     def soul_file(self) -> Path:
-        # Global only. TODO(persona-API): when a per-admin SOUL.md override can
-        # exist, Dream/consolidation must read via resolve_overridable_file too,
-        # else it consolidates against the wrong soul while the prompt builder
-        # uses the override.
+        # Global only — used solely by Dream consolidation (read_soul/write_soul,
+        # memory.py Dream.run) and GitStore tracking. Dream runs ONLY from the
+        # "dream" cron job, which is disabled in prod, so this is currently dormant
+        # and the live prompt builder (context.py, via resolve_overridable_file)
+        # already resolves SOUL per-admin.
+        # WS-B BLOCKER: SOUL.md is now seeded per-admin (provision_admin), so the
+        # moment Dream/cron is re-enabled this desyncs for EVERY admin — Dream would
+        # read/write global SOUL while the prompt uses the per-admin file. Before
+        # enabling Dream, route soul_file + GitStore.tracked_files through
+        # resolve_overridable_file (per-admin-aware), and handle the write path
+        # (write_soul must target the per-admin file, not clobber the global root).
         return self.workspace / "SOUL.md"
 
     def resolve_overridable_file(self, filename: str) -> Path:
