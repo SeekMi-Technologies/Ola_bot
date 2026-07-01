@@ -1,7 +1,7 @@
 """Agent behavior tests — comprehensive multi-file analysis (issue #388).
 
 Verifies that the runner correctly handles the tool-call pattern that
-SOUL.md's "Comprehensive multi-file analysis" section relies on:
+recordings/SKILL.md's "Comprehensive multi-file analysis" section relies on:
 
   file.search → [file.get_transcript(A), file.get_transcript(B), file.get_transcript(C)]
                (all three emitted in ONE LLM iteration → concurrent execution)
@@ -13,7 +13,7 @@ a scripted provider that returns pre-planned tool calls, asserting that:
   1. All file.get_transcript calls that the LLM emits in one iteration are
      executed (concurrent_tools=True works end-to-end for this flow).
   2. The runner collects all results before the LLM makes its final text call.
-  3. SOUL.md structurally contains the required comprehensive-analysis section.
+  3. recordings/SKILL.md structurally contains the required comprehensive-analysis section.
 """
 
 from __future__ import annotations
@@ -32,21 +32,23 @@ from nanobot.providers.base import LLMResponse, ToolCallRequest
 #   parents[1] = nanobot/tests/
 #   parents[2] = nanobot/
 #   parents[3] = SeekMi_Tech/
-SOUL_PATH = (
+SKILL_PATH = (
     Path(__file__).parents[3]
     / "Ola"
     / "ola"
     / "nanobot-workspace"
-    / "SOUL.md"
+    / "skills"
+    / "recordings"
+    / "SKILL.md"
 )
 
 _MAX_TOOL_RESULT_CHARS = 100_000
 
 
-def _soul() -> str:
-    if not SOUL_PATH.exists():
-        pytest.skip(f"SOUL.md not found at {SOUL_PATH}")
-    return SOUL_PATH.read_text(encoding="utf-8")
+def _skill() -> str:
+    if not SKILL_PATH.exists():
+        pytest.skip(f"recordings/SKILL.md not found at {SKILL_PATH}")
+    return SKILL_PATH.read_text(encoding="utf-8")
 
 
 def _make_tools_mock(execute_fn) -> MagicMock:
@@ -70,34 +72,34 @@ def _make_provider(scripted_chat) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-class TestSoulComprehensiveSection:
+class TestSkillComprehensiveSection:
     """Pin the load-bearing anchors of the comprehensive-analysis prompt rule."""
 
     def test_section_exists(self):
-        assert "## Comprehensive multi-file analysis" in _soul()
+        assert "## Comprehensive multi-file analysis" in _skill()
 
     def test_path_a_batch_instruction(self):
-        assert "one single LLM iteration" in _soul()
+        assert "single LLM iteration" in _skill()
 
     def test_path_b_no_file_tool_calls(self):
-        soul = _soul()
-        assert "Path B" in soul
-        assert "No file.* tool calls" in soul
+        skill = _skill()
+        assert "Path B" in skill
+        assert "zero `file.*` tool calls" in skill
 
     def test_report_requires_three_sections(self):
-        soul = _soul()
+        skill = _skill()
         for section in ("共同主题", "关键差异", "综合结论"):
-            assert section in soul, f"missing required report section: {section}"
+            assert section in skill, f"missing required report section: {section}"
 
     def test_hard_rules_present(self):
-        soul = _soul()
+        skill = _skill()
         for rule in (
             "No per-file progress commentary",
             "No duplicate tool calls",
             "No invented content",
             "No mixing paths",
         ):
-            assert rule in soul, f"missing hard rule: {rule}"
+            assert rule in skill, f"missing hard rule: {rule}"
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ class TestSoulComprehensiveSection:
 class TestRunnerBatchToolCalls:
     """Verify AgentRunner executes all tool calls emitted in one iteration.
 
-    This is the mechanical precondition that SOUL.md's Path A relies on:
+    This is the mechanical precondition that recordings/SKILL.md's Path A relies on:
     when the LLM emits file.get_transcript for N files in one response,
     all N calls must be executed before the next LLM iteration.
     """
