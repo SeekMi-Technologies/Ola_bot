@@ -3,6 +3,7 @@
 import base64
 import mimetypes
 import platform
+from enum import Enum
 from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any
@@ -13,12 +14,25 @@ from nanobot.utils.helpers import build_assistant_message, current_time_str, det
 from nanobot.utils.prompt_templates import render_template
 
 
+class BootstrapScope(Enum):
+    """Tenancy scope of a bootstrap file — declared in exactly one place."""
+
+    GLOBAL = "global"            # always workspace root; security layer, never per-admin
+    OVERRIDABLE = "overridable"  # admins/<id>/<file> if present, else workspace root
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    # Bootstrap files read from workspace root (global / per-tenant).
+    # Single source of truth: each bootstrap file with its tenancy scope.
+    # AGENTS.md is the security layer and never accepts a per-admin override;
+    # SOUL.md / TOOLS.md resolve per-admin-first with global fallback.
     # USER.md is per-admin and loaded via self.memory.user_file instead.
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = {
+        "AGENTS.md": BootstrapScope.GLOBAL,
+        "SOUL.md": BootstrapScope.OVERRIDABLE,
+        "TOOLS.md": BootstrapScope.OVERRIDABLE,
+    }
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     _MAX_HISTORY_CHARS = 32_000  # hard cap on recent history section size
@@ -119,8 +133,12 @@ class ContextBuilder:
         """Load global workspace bootstrap files + per-admin USER.md."""
         parts = []
 
-        for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
+        for filename, scope in self.BOOTSTRAP_FILES.items():
+            file_path = (
+                self.memory.resolve_overridable_file(filename)
+                if scope is BootstrapScope.OVERRIDABLE
+                else self.workspace / filename
+            )
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")

@@ -508,8 +508,8 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     for item in tpl.iterdir():
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    _write(None, workspace / "memory" / "history.jsonl")
+    # memory/ is per-admin now (admins/<id>/memory, seeded by provision_admin);
+    # no root memory/ seeding.
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:
@@ -527,7 +527,6 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
             tracked_files=[
                 "SOUL.md",
                 "USER.md",
-                "memory/MEMORY.md",
             ],
         )
         gs.init()
@@ -535,3 +534,55 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         logger.warning("Failed to initialize git store for {}", workspace)
 
     return added
+
+
+# Seeded per-admin from the workspace-root template: SOUL.md (persona) and
+# USER.md (profile) — both are per-company templates each tenant fills in, and
+# become the editable per-user files (devboard persona control-plane). TOOLS.md
+# is NOT seeded (shared operational guidance — stays global, propagates on deploy)
+# and AGENTS.md is never per-admin (authority/security layer). The read-time
+# resolver still falls back to global for any file a tenant doesn't have yet.
+_PER_ADMIN_SEED_FILES = ("USER.md", "SOUL.md")
+
+
+def provision_admin(workspace: Path, admin_id: str | None) -> bool:
+    """Lazily create a per-admin workspace skeleton. Idempotent and never
+    overwrites; returns True only if it created something.
+
+    Seeds SOUL.md + USER.md from the workspace-root templates (per-company,
+    editable per tenant). TOOLS.md is not copied (stays global) and AGENTS.md is
+    never per-admin. MEMORY.md / history.jsonl start empty. _system, None, and
+    path-traversal-unsafe ids are no-ops (no dir created).
+    """
+    from nanobot.agent.admin_context import SYSTEM_ADMIN_ID, is_valid_admin_id
+
+    if admin_id == SYSTEM_ADMIN_ID or not is_valid_admin_id(admin_id):
+        return False
+
+    admin_dir = workspace / "admins" / admin_id
+    marker = admin_dir / ".provisioned"
+    if marker.exists():  # fast path — keeps repeat messages zero-write
+        return False
+
+    ensure_dir(admin_dir / "memory")
+    ensure_dir(admin_dir / "sessions")
+
+    for filename in _PER_ADMIN_SEED_FILES:
+        dest = admin_dir / filename
+        if dest.exists():
+            continue
+        root_template = workspace / filename
+        if root_template.exists():
+            _write_text_atomic(dest, root_template.read_text(encoding="utf-8"))
+        else:
+            logger.warning(
+                "provision_admin: workspace-root {} missing; skipped seeding it for {}",
+                filename, admin_id,
+            )
+
+    for empty_file in (admin_dir / "memory" / "MEMORY.md", admin_dir / "memory" / "history.jsonl"):
+        if not empty_file.exists():
+            _write_text_atomic(empty_file, "")
+
+    _write_text_atomic(marker, "")
+    return True

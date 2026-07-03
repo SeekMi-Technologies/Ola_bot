@@ -270,6 +270,40 @@ def test_effective_bridge_token_raises_when_admin_id_set_but_secret_missing(monk
         ch._effective_bridge_token()
 
 
+def test_resolve_ws_url_uses_portfile_for_loopback_bridge(monkeypatch, tmp_path):
+    admin_id = "507f1f77bcf86cd799439011"
+    monkeypatch.setenv("MCP_SERVICE_TOKEN", "TEST_SECRET_123")
+    monkeypatch.setattr("nanobot.channels.whatsapp.Path.home", lambda: tmp_path)
+    wa_root = tmp_path / ".nanobot" / "wa"
+    wa_root.mkdir(parents=True)
+    (wa_root / "bridge.port").write_text("4321")
+
+    ch = WhatsAppChannel(
+        {"enabled": True, "adminId": admin_id, "bridgeUrl": "ws://127.0.0.1:3001"},
+        MagicMock(),
+    )
+
+    assert ch._resolve_ws_url().startswith(f"ws://127.0.0.1:4321/wa/{admin_id}?token=")
+
+
+def test_resolve_ws_url_preserves_remote_bridge_host(monkeypatch, tmp_path):
+    admin_id = "507f1f77bcf86cd799439011"
+    monkeypatch.setenv("MCP_SERVICE_TOKEN", "TEST_SECRET_123")
+    monkeypatch.setattr("nanobot.channels.whatsapp.Path.home", lambda: tmp_path)
+    wa_root = tmp_path / ".nanobot" / "wa"
+    wa_root.mkdir(parents=True)
+    (wa_root / "bridge.port").write_text("4321")
+
+    ch = WhatsAppChannel(
+        {"enabled": True, "adminId": admin_id, "bridgeUrl": "ws://nanobot-bridge:3001"},
+        MagicMock(),
+    )
+
+    assert ch._resolve_ws_url().startswith(
+        f"ws://nanobot-bridge:3001/wa/{admin_id}?token="
+    )
+
+
 @pytest.mark.asyncio
 async def test_start_uses_multi_tenant_url_when_admin_id_set(monkeypatch, tmp_path):
     """Multi-tenant mode: ws_url = <base>/wa/<adminId>?token=<hmac>; no auth msg sent."""
@@ -405,7 +439,7 @@ async def test_voice_message_transcription_uses_media_path():
 
     ch.transcribe_audio.assert_awaited_once_with("/tmp/voice.ogg")
     kwargs = ch._handle_message.await_args.kwargs
-    assert kwargs["content"].startswith("Hello world")
+    assert "Hello world" in kwargs["content"]
 
 
 @pytest.mark.asyncio
@@ -427,6 +461,170 @@ async def test_voice_message_no_media_shows_not_available():
 
     kwargs = ch._handle_message.await_args.kwargs
     assert kwargs["content"] == "[Voice Message: Audio not available]"
+
+
+# ---------------------------------------------------------------------------
+# Transcription ack (issue #387) — immediate feedback before Groq/Whisper call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_voice_message_sends_ack_before_transcription():
+    """Ack message is sent via _ws before transcribe_audio is awaited."""
+    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    ch._ws = AsyncMock()
+    ch._connected = True
+    ch._handle_message = AsyncMock()
+
+    call_order: list[str] = []
+
+    async def fake_transcribe(path):  # noqa: ARG001
+        call_order.append("transcribe")
+        return "Hello"
+
+    ch._ws.send = AsyncMock(side_effect=lambda _: call_order.append("ack"))
+    ch.transcribe_audio = fake_transcribe
+
+    await ch._handle_bridge_message(
+        json.dumps({
+            "type": "message",
+            "id": "ack1",
+            "sender": "1234@s.whatsapp.net",
+            "pn": "1234@s.whatsapp.net",
+            "content": "[Voice Message]",
+            "timestamp": 1,
+            "media": ["/tmp/voice.ogg"],
+        })
+    )
+
+    assert call_order[0] == "ack", "ack must be sent before transcription starts"
+    assert "transcribe" in call_order
+
+
+@pytest.mark.asyncio
+async def test_voice_message_ack_targets_correct_sender():
+    """Ack payload addresses the full sender JID (not phone-only sender_id)."""
+    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    ch._ws = AsyncMock()
+    ch._connected = True
+    ch._handle_message = AsyncMock()
+    ch.transcribe_audio = AsyncMock(return_value="ok")
+
+    sender_jid = "5559876@s.whatsapp.net"
+    await ch._handle_bridge_message(
+        json.dumps({
+            "type": "message",
+            "id": "ack2",
+            "sender": sender_jid,
+            "pn": sender_jid,
+            "content": "[Voice Message]",
+            "timestamp": 1,
+            "media": ["/tmp/voice.ogg"],
+        })
+    )
+
+    # First send call is the ack; its "to" must be the full JID
+    first_payload = json.loads(ch._ws.send.call_args_list[0][0][0])
+    assert first_payload["type"] == "send"
+    assert first_payload["to"] == sender_jid
+    assert first_payload["text"] == "正在转写语音消息，请稍候..."
+
+
+@pytest.mark.asyncio
+async def test_voice_message_ack_not_sent_when_disconnected():
+    """No ack when _connected is False — channel is in reconnect state."""
+    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    ch._ws = AsyncMock()
+    ch._connected = False
+    ch._handle_message = AsyncMock()
+    ch.transcribe_audio = AsyncMock(return_value="ok")
+
+    await ch._handle_bridge_message(
+        json.dumps({
+            "type": "message",
+            "id": "ack3",
+            "sender": "1234@s.whatsapp.net",
+            "pn": "1234@s.whatsapp.net",
+            "content": "[Voice Message]",
+            "timestamp": 1,
+            "media": ["/tmp/voice.ogg"],
+        })
+    )
+
+    ch._ws.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_voice_message_ack_disabled_when_empty_string():
+    """transcription_ack='' disables the ack (operator opt-out)."""
+    ch = WhatsAppChannel({"enabled": True, "transcriptionAck": ""}, MagicMock())
+    ch._ws = AsyncMock()
+    ch._connected = True
+    ch._handle_message = AsyncMock()
+    ch.transcribe_audio = AsyncMock(return_value="ok")
+
+    await ch._handle_bridge_message(
+        json.dumps({
+            "type": "message",
+            "id": "ack4",
+            "sender": "1234@s.whatsapp.net",
+            "pn": "1234@s.whatsapp.net",
+            "content": "[Voice Message]",
+            "timestamp": 1,
+            "media": ["/tmp/voice.ogg"],
+        })
+    )
+
+    ch._ws.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_voice_message_ack_failure_does_not_abort_transcription():
+    """If the ack ws.send raises, transcription still proceeds (non-blocking)."""
+    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    ch._ws = AsyncMock()
+    ch._ws.send = AsyncMock(side_effect=Exception("ws error"))
+    ch._connected = True
+    ch._handle_message = AsyncMock()
+    ch.transcribe_audio = AsyncMock(return_value="recovered")
+
+    await ch._handle_bridge_message(
+        json.dumps({
+            "type": "message",
+            "id": "ack5",
+            "sender": "1234@s.whatsapp.net",
+            "pn": "1234@s.whatsapp.net",
+            "content": "[Voice Message]",
+            "timestamp": 1,
+            "media": ["/tmp/voice.ogg"],
+        })
+    )
+
+    ch.transcribe_audio.assert_awaited_once()
+    kwargs = ch._handle_message.await_args.kwargs
+    assert "recovered" in kwargs["content"]
+
+
+@pytest.mark.asyncio
+async def test_text_message_does_not_trigger_ack():
+    """Regular text messages must not trigger any ack send."""
+    ch = WhatsAppChannel({"enabled": True}, MagicMock())
+    ch._ws = AsyncMock()
+    ch._connected = True
+    ch._handle_message = AsyncMock()
+
+    await ch._handle_bridge_message(
+        json.dumps({
+            "type": "message",
+            "id": "ack6",
+            "sender": "1234@s.whatsapp.net",
+            "pn": "1234@s.whatsapp.net",
+            "content": "What's the price of steel?",
+            "timestamp": 1,
+        })
+    )
+
+    ch._ws.send.assert_not_called()
 
 
 def test_load_or_create_bridge_token_persists_generated_secret(tmp_path):

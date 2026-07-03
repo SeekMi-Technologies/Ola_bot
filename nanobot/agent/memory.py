@@ -75,8 +75,25 @@ class MemoryStore:
 
     @property
     def soul_file(self) -> Path:
-        # Global, per-tenant. Stays at workspace root until multi-customer.
+        # Global only — used solely by Dream consolidation (read_soul/write_soul,
+        # memory.py Dream.run) and GitStore tracking. Dream runs ONLY from the
+        # "dream" cron job, which is disabled in prod, so this is currently dormant
+        # and the live prompt builder (context.py, via resolve_overridable_file)
+        # already resolves SOUL per-admin.
+        # WS-B BLOCKER: SOUL.md is now seeded per-admin (provision_admin), so the
+        # moment Dream/cron is re-enabled this desyncs for EVERY admin — Dream would
+        # read/write global SOUL while the prompt uses the per-admin file. Before
+        # enabling Dream, route soul_file + GitStore.tracked_files through
+        # resolve_overridable_file (per-admin-aware), and handle the write path
+        # (write_soul must target the per-admin file, not clobber the global root).
         return self.workspace / "SOUL.md"
+
+    def resolve_overridable_file(self, filename: str) -> Path:
+        """Read-time resolution for a per-admin-overridable bootstrap file:
+        admins/<acting-id>/<filename> if it exists, else the global
+        workspace-root file. Read-only — no copies, no writes, no dir creation."""
+        per_admin = self.workspace / "admins" / get_admin_dir_name() / filename
+        return per_admin if per_admin.exists() else self.workspace / filename
 
     @property
     def _cursor_file(self) -> Path:

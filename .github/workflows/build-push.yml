@@ -1,0 +1,85 @@
+name: Build & Push Image
+
+# Builds the nanobot service image and pushes it to GHCR so the Ola CRM deploy
+# can pull the identical tag (by commit SHA) — the AI-tier counterpart to the
+# CRM repo's build-push workflow.
+#
+# Runs only on pushes to the release branches (ola-main = prod, ola-dev = dev)
+# and manual dispatch. Never on pull_request — we don't publish images from PRs.
+# Leaves the existing ci.yml (test suite) untouched.
+
+on:
+  push:
+    branches: [ola-main, ola-dev]
+  workflow_dispatch:
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    name: Build & push ola-nanobot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/seekmi-technologies/ola-nanobot
+          tags: |
+            # Immutable per-commit tag == github.sha; deploy pulls this exact build.
+            type=sha,format=long,prefix=
+            # Moving branch tag: :ola-main / :ola-dev.
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  notify-staging:
+    name: Notify Ola staging
+    if: github.ref_name == 'ola-dev'
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch immutable nanobot SHA
+        env:
+          GH_TOKEN: ${{ secrets.OLA_DEPLOY_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::OLA_DEPLOY_TOKEN is not configured; staging notification skipped"
+            exit 0
+          fi
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/SeekMi-Technologies/Ola/dispatches \
+            -d "{\"event_type\":\"nanobot-image\",\"client_payload\":{\"sha\":\"$SHA\"}}"

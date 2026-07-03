@@ -15,9 +15,10 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.admin_context import get_acting_admin_id
 from nanobot.agent.tools.mcp import set_acting_as
 from nanobot.config.paths import get_media_dir
-from nanobot.utils.helpers import safe_filename
+from nanobot.utils.helpers import provision_admin, safe_filename
 from nanobot.utils.media_decode import (
     FileSizeExceeded as _FileSizeExceeded,
     MAX_FILE_SIZE,
@@ -234,6 +235,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     # X-Acting-As baked into the httpx client headers. Header absent → stays
     # None → backend falls back to systemAdmin.
     set_acting_as(request.headers.get("X-Ola-Acting-As"))
+    await asyncio.to_thread(provision_admin, request.app["agent_loop"].workspace, get_acting_admin_id())
 
     content_type = request.content_type or ""
     if not isinstance(content_type, str):
@@ -498,4 +500,10 @@ def create_app(
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+
+    # Persona control-plane (devboard) — rides serve's already-Tailscale-exposed
+    # port; token-gated per handler, so chat/health stay unauthenticated as before.
+    from nanobot.api.persona_api import add_persona_routes
+
+    add_persona_routes(app, agent_loop.workspace)
     return app

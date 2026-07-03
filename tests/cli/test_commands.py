@@ -66,7 +66,9 @@ def test_onboard_fresh_install(mock_paths):
     assert "nanobot is ready" in result.stdout
     assert config_file.exists()
     assert (workspace_dir / "AGENTS.md").exists()
-    assert (workspace_dir / "memory" / "MEMORY.md").exists()
+    # memory/ is per-admin now (admins/<id>/memory via provision_admin); the
+    # workspace root no longer gets a seeded memory/MEMORY.md (#354).
+    assert not (workspace_dir / "memory" / "MEMORY.md").exists()
     expected_workspace = Config().workspace_path
     assert mock_ws.call_args.args == (expected_workspace,)
 

@@ -11,7 +11,7 @@
  * Routing (Authorization: Bearer <hmac> for REST; token=<hmac> query for WS):
  * - WS:     /wa/<adminId>?token=<hmac>  — per-admin bidirectional stream
  * - POST    /wa/<adminId>/login         — CRM triggers connect; QR arrives via snapshot
- * - GET     /wa/<adminId>/status        — { status, qr? } from snapshot
+ * - GET     /wa/<adminId>/status        — { status, gatewayClients, qr? } from snapshot
  * - DELETE  /wa/<adminId>               — disconnect + wipe authDir (logout)
  *
  * Lifecycle:
@@ -302,6 +302,12 @@ export class BridgeServer {
   }
 
   private handleRest(req: IncomingMessage, res: ServerResponse): void {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+
     const p = parseWaPath(req.url);
     if (!p) {
       res.writeHead(404).end();
@@ -337,7 +343,17 @@ export class BridgeServer {
   /** GET /status — return the live snapshot (qr only while pending). */
   private restStatus(adminId: string, res: ServerResponse): void {
     const snap = this.state.get(adminId) ?? { status: 'disconnected' };
-    const body: WaSnapshot = { status: snap.status };
+    // gatewayClients = live nanobot-gateway WS subscribers for this admin. Lets
+    // deploy verification confirm the gateway↔bridge link without scraping
+    // container logs (Ola #366 follow-up: log lines age out of `--since` windows).
+    let gatewayClients = 0;
+    const subs = this.sockets.get(adminId);
+    if (subs) {
+      for (const ws of subs) {
+        if (ws.readyState === WebSocket.OPEN) gatewayClients++;
+      }
+    }
+    const body: WaSnapshot & { gatewayClients: number } = { status: snap.status, gatewayClients };
     if (snap.status === 'qr_pending' && snap.qr) body.qr = snap.qr;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(body));
